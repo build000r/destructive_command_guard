@@ -7585,7 +7585,7 @@ pub(crate) fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize)
 /// heredoc content was replaced with placeholder text.
 #[must_use]
 pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
-    mask_non_executing_heredocs_with_policy(command, false)
+    mask_non_executing_heredocs_with_policy(command, false, false)
 }
 
 /// Mask the data of heredoc bodies whose target consumes stdin as data,
@@ -7606,12 +7606,19 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
 /// (`data_heredoc_bodies_whose_output_may_run`).
 #[must_use]
 pub fn mask_non_expanding_data_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
-    mask_non_executing_heredocs_with_policy(command, true)
+    mask_non_executing_heredocs_with_policy(command, true, false)
+}
+
+/// Preserve the original Python syntax while proving report data, before shell
+/// token normalization can change its quoting or merge its argv literals.
+pub(crate) fn mask_python_json_reports(command: &str) -> std::borrow::Cow<'_, str> {
+    mask_non_executing_heredocs_with_policy(command, true, true)
 }
 
 fn mask_non_executing_heredocs_with_policy(
     command: &str,
     require_quoted_delimiter: bool,
+    python_reports_only: bool,
 ) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
 
@@ -7682,6 +7689,7 @@ fn mask_non_executing_heredocs_with_policy(
                 stdin_data_sink_may_be_overridden(command, heredoc_start, target)
             });
             let should_mask_herestring = !require_quoted_delimiter
+                && !python_reports_only
                 && !target_may_be_overridden
                 && !stdin_is_the_program(command, heredoc_start)
                 && (target_cmd.as_ref().is_some_and(|cmd| {
@@ -7789,7 +7797,8 @@ fn mask_non_executing_heredocs_with_policy(
                         .as_deref()
                         .is_some_and(is_noop_stdin_discarding_command)))
             && !*output_executed.get_or_insert_with(|| written_file_is_executed(command, &bodies));
-        let should_mask = target_is_data_sink && keep_spans.is_some();
+        let should_mask =
+            target_is_data_sink && (!python_reports_only || python_report) && keep_spans.is_some();
 
         if should_mask {
             // Tree-sitter's body span is authoritative for delimiter quote

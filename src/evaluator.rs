@@ -13571,8 +13571,11 @@ fn evaluate_command_in_single_dialect_view(
     // or an unmatched apostrophe, both of which are ordinary bytes in Cmd.
     // Start from the original command for a proven Cmd hook and let the native
     // token overlay below perform the safe-data masking.
+    let report_data = crate::heredoc::mask_python_json_reports(command);
     let sanitized = if shell_dialect == ShellDialect::Cmd {
         Cow::Borrowed(command)
+    } else if !matches!(report_data, Cow::Borrowed(_)) {
+        sanitize_for_pattern_matching(report_data.as_ref())
     } else {
         precomputed_sanitized.unwrap_or_else(|| sanitize_for_pattern_matching(command))
     };
@@ -28648,6 +28651,35 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_python_reports_preserve_service_execution_decisions() {
+        for source in [
+            "import json\nprint(json.dumps({'rule': 'system.services:reboot'}))\n",
+            "import json, subprocess\nx = subprocess.run(['systemctl', '--user', 'show', 'sbpd.service'], capture_output=True, text=True)\nprint(json.dumps({'observed': x.stdout, 'proposed_command': 'systemctl --user disable --now sbpd.service'}))\n",
+        ] {
+            let command = format!("python3 - <<'PY'\n{source}PY");
+            let result = evaluate_with_pack_ids(
+                &command,
+                &["system.services", "core.git", "core.filesystem"],
+            );
+            assert!(result.is_allowed(), "report must allow: {result:?}");
+        }
+        for source in [
+            "import json, subprocess\nsubprocess.run(['systemctl', '--user', 'disable', '--now', 'sbpd.service'])\nprint(json.dumps({}))\n",
+            "import json\nf = exec\nf('reboot')\nprint(json.dumps({}))\n",
+        ] {
+            let command = format!("python3 - <<'PY'\n{source}PY");
+            assert!(
+                evaluate_with_pack_ids(
+                    &command,
+                    &["system.services", "core.git", "core.filesystem"]
+                )
+                .is_denied(),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn deferred_commands_and_brace_commands_are_viewed_after_their_prefix() {
