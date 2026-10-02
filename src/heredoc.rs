@@ -7754,16 +7754,35 @@ fn mask_non_executing_heredocs_with_policy(
             stdin_data_sink_may_be_overridden(command, heredoc_start, target)
         });
 
+        // A small, closed Python report language can establish data flow without
+        // treating arbitrary interpreter source as inert (#136). Unknown calls,
+        // rebinding, dynamic process argv, and executable output remain visible.
+        let python_report = delimiter_quoted
+            && target_cmd
+                .as_deref()
+                .is_some_and(|target| matches!(target, "python" | "python3" | "/usr/bin/python3"))
+            && command[..heredoc_start]
+                .rsplit(['\n', ';', '|', '&'])
+                .next()
+                .is_some_and(|prefix| {
+                    matches!(
+                        prefix.trim(),
+                        "python -" | "python3 -" | "/usr/bin/python3 -"
+                    )
+                })
+            && output_of(&active_heredoc) == HeredocOutput::Contained
+            && python_json_report_is_data(&command[body_start..body_end]);
+
         // Mask the body out of the raw-shell rescan when the target either
         // (a) does not execute its stdin at all (cat/tee/…), or
-        // (b) is a non-shell interpreter reading its program from the body
-        //     (python -/node -/ruby/…), which the language-aware AST path has
-        //     already analyzed authoritatively (#136). Shell interpreters are
-        //     excluded so real `bash <<SH … rm -rf … SH` still blocks.
+        // (b) is an explicitly proved, bounded Python JSON report. General
+        // interpreter source still receives the conservative raw-shell scan.
         let target_is_data_sink = !target_may_be_overridden
             && !stdin_is_the_program(command, heredoc_start)
             && (target_cmd.as_ref().is_some_and(|cmd| {
-                is_non_executing_heredoc_command(cmd) || is_interpreter_source_heredoc_command(cmd)
+                is_non_executing_heredoc_command(cmd)
+                    || is_interpreter_source_heredoc_command(cmd)
+                    || python_report
             }) || is_structured_stdin_data_sink(command, heredoc_start)
                 || (delimiter_quoted
                     && target_cmd
@@ -7820,6 +7839,210 @@ fn mask_non_executing_heredocs_with_policy(
     } else {
         Cow::Owned(result)
     }
+}
+
+/// Prove a bounded Python JSON-report program has no executable-text sink.
+/// This is deliberately a closed grammar, not a general Python taint heuristic.
+/// The default interpreter backstop remains in force outside this grammar.
+fn python_json_report_is_data(source: &str) -> bool {
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    if source.len() > 16_384 || !source.contains("json.dumps") {
+        return false;
+    }
+    let ast = AstGrep::new(source, SupportLang::Python);
+    let root = ast.root();
+    let started = Instant::now();
+    let mut pending = vec![root];
+    let mut count = 0;
+    while let Some(node) = pending.pop() {
+        count += 1;
+        if count > 2_048 || started.elapsed() > Duration::from_millis(2) {
+            return false;
+        }
+        if !node.is_named() {
+            continue;
+        }
+        match node.kind().as_ref() {
+            "module"
+            | "expression_statement"
+            | "argument_list"
+            | "identifier"
+            | "dotted_name"
+            | "string"
+            | "string_start"
+            | "string_content"
+            | "string_end"
+            | "escape_sequence"
+            | "integer"
+            | "float"
+            | "true"
+            | "false"
+            | "none"
+            | "list"
+            | "tuple"
+            | "dictionary"
+            | "pair"
+            | "parenthesized_expression"
+            | "subscript"
+            | "binary_operator"
+            | "comparison_operator"
+            | "boolean_operator"
+            | "not_operator"
+            | "if_statement"
+            | "else_clause"
+            | "block"
+            | "comment" => {}
+            "import_statement" => {
+                if !node
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .all(|child| matches!(child.text().as_ref(), "json" | "subprocess"))
+                {
+                    return false;
+                }
+            }
+            "assignment" => {
+                let Some(left) = node.field("left") else {
+                    return false;
+                };
+                if left.kind() != "identifier"
+                    || matches!(
+                        left.text().as_ref(),
+                        "json"
+                            | "subprocess"
+                            | "pathlib"
+                            | "hashlib"
+                            | "os"
+                            | "print"
+                            | "dict"
+                            | "str"
+                            | "len"
+                    )
+                {
+                    return false;
+                }
+            }
+            "attribute" => {
+                let Some(member) = node.field("attribute") else {
+                    return false;
+                };
+                let is_callee = node.parent().is_some_and(|parent| {
+                    parent.kind() == "call"
+                        && parent
+                            .field("function")
+                            .is_some_and(|function| function.range() == node.range())
+                });
+                if !is_callee
+                    && !matches!(member.text().as_ref(), "stdout" | "stderr" | "returncode")
+                {
+                    return false;
+                }
+            }
+            "call" => {
+                let Some(function) = node.field("function") else {
+                    return false;
+                };
+                let name = function.text();
+                let Some(arguments) = node.field("arguments") else {
+                    return false;
+                };
+                let keywords: Vec<_> = arguments
+                    .children()
+                    .filter(|arg| arg.kind() == "keyword_argument")
+                    .collect();
+                let allowed_keyword = |arg: &ast_grep_core::Node<'_, _>, allowed: &[&str]| {
+                    arg.field("name")
+                        .is_some_and(|name| allowed.contains(&name.text().as_ref()))
+                };
+                match name.as_ref() {
+                    "print" | "dict" | "str" | "len" => {
+                        if !keywords.is_empty() {
+                            return false;
+                        }
+                    }
+                    "json.dumps" => {
+                        if !keywords.iter().all(|arg| {
+                            allowed_keyword(arg, &["indent", "sort_keys", "ensure_ascii"])
+                        }) {
+                            return false;
+                        }
+                    }
+                    "subprocess.run" => {
+                        if !keywords
+                            .iter()
+                            .all(|arg| allowed_keyword(arg, &["capture_output", "text", "check"]))
+                        {
+                            return false;
+                        }
+                        let args: Vec<_> = arguments
+                            .children()
+                            .filter(|arg| arg.is_named() && arg.kind() != "keyword_argument")
+                            .collect();
+                        if args.len() != 1 || args[0].kind() != "list" {
+                            return false;
+                        }
+                        let mut words = Vec::new();
+                        for word in args[0].children().filter(ast_grep_core::Node::is_named) {
+                            let text = word.text();
+                            if word.kind() != "string" || text.len() < 2 {
+                                return false;
+                            }
+                            let bytes = text.as_bytes();
+                            if !matches!(bytes[0], b'\'' | b'"')
+                                || bytes[0] != bytes[bytes.len() - 1]
+                            {
+                                return false;
+                            }
+                            let value = &text[1..text.len() - 1];
+                            if value.contains(['\\', '\n', '\r', '\'', '"']) {
+                                return false;
+                            }
+                            words.push(value.to_owned());
+                        }
+                        if words.first().map(String::as_str) != Some("systemctl") {
+                            return false;
+                        }
+                        let verb = words
+                            .iter()
+                            .skip(1)
+                            .find(|word| !matches!(word.as_str(), "--user" | "--system"));
+                        if !verb.is_some_and(|verb| {
+                            matches!(
+                                verb.as_str(),
+                                "show"
+                                    | "status"
+                                    | "cat"
+                                    | "list-units"
+                                    | "list-unit-files"
+                                    | "is-active"
+                                    | "is-enabled"
+                                    | "is-failed"
+                            )
+                        }) {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        if function.kind() != "attribute" || !keywords.is_empty() {
+                            return false;
+                        }
+                        let Some(member) = function.field("attribute") else {
+                            return false;
+                        };
+                        if !matches!(member.text().as_ref(), "split" | "splitlines") {
+                            return false;
+                        }
+                    }
+                }
+            }
+            "keyword_argument" => {}
+            _ => return false,
+        }
+        pending.extend(node.children());
+    }
+    true
 }
 
 /// The bodies of data-sink heredocs (`cat`, `tee`, `grep`, … — targets the
@@ -9116,9 +9339,24 @@ fn heredoc_output<D: ast_grep_core::Doc>(
         }
         _ => return None,
     };
-    // The body is only as contained as the output when its owner passes it
-    // through untouched; otherwise nothing about it is proven here.
-    if !owner_passes_body_through(command.clone()) {
+    // A proved JSON report produces data as well. General interpreters retain
+    // the unproved-output answer, even if their output appears to stay put.
+    // The grammar drops a standalone '-' operand from the command span. Use
+    // the header bytes up to this proven redirect operator instead.
+    let statement_text = statement.text();
+    let header_end = redirect.range().start.checked_sub(statement.range().start);
+    let python_report = header_end
+        .and_then(|end| statement_text.get(..end))
+        .is_some_and(|header| {
+            matches!(
+                header.trim(),
+                "python -" | "python3 -" | "/usr/bin/python3 -"
+            )
+        })
+        && redirect.children().any(|child| {
+            child.kind() == "heredoc_body" && python_json_report_is_data(&child.text())
+        });
+    if !owner_passes_body_through(command.clone()) && !python_report {
         return None;
     }
     let mut filed = false;
@@ -14313,6 +14551,65 @@ fi"#;
                 "{cmd} must NOT be masked as interpreter source (#136 reverted — masking executes is unsound)"
             );
         }
+    }
+
+    #[test]
+    fn bounded_python_json_reports_mask_only_proved_data() {
+        for source in [
+            "import json\nprint(json.dumps({'rule': 'system.services:reboot'}))\n",
+            "import json, subprocess\nx = subprocess.run(['systemctl', '--user', 'show', 'sbpd.service'], capture_output=True, text=True)\nprint(json.dumps({'observed': x.stdout, 'proposed_command': 'systemctl --user disable --now sbpd.service'}))\n",
+        ] {
+            assert!(python_json_report_is_data(source), "{source}");
+            let command = format!("python3 - <<'PY'\n{source}PY");
+            let masked = mask_non_executing_heredocs(&command);
+            assert!(
+                !masked.contains("system.services:reboot"),
+                "masked={masked:?}; heredocs={:?}",
+                active_heredocs(&command)
+            );
+            assert!(!masked.contains("disable --now"));
+            assert_eq!(masked.len(), command.len());
+        }
+    }
+
+    #[test]
+    fn bounded_python_report_proof_rejects_execution_and_unknown_sinks() {
+        for source in [
+            "import json, os\nc = 'reboot'\nos.system(c)\nprint(json.dumps({}))\n",
+            "import json\nf = exec\nf('reboot')\nprint(json.dumps({}))\n",
+            "import json\nprint(json.dumps({}, default=exec))\n",
+            "import json, subprocess\nsubprocess.run(['systemctl', '--user', 'disable', '--now', 'sbpd.service'])\nprint(json.dumps({}))\n",
+            "import json, subprocess\nsubprocess.run(['systemctl', 'show'], shell=True)\nprint(json.dumps({}))\n",
+            "import json, subprocess\nsubprocess.run(['systemctl', 'show'], executable='/tmp/evil')\nprint(json.dumps({}))\n",
+            "import json\njson = __import__('os')\nprint(json.dumps({}))\n",
+            "import json\nprint = exec\nprint(json.dumps({}))\n",
+            "import json, pathlib\npathlib.Path('/tmp/program.py').write_text('reboot')\nprint(json.dumps({}))\n",
+            "import json\nprint(json.dumps({x: x for json in []}))\n",
+            "import json\nprint(json.dumps(f'{exec(\"reboot\")}'))\n",
+            "import json\nprint(json.dumps(\n",
+        ] {
+            assert!(!python_json_report_is_data(source), "{source}");
+        }
+        assert!(!python_json_report_is_data(&" ".repeat(16_385)));
+    }
+
+    #[test]
+    fn bounded_python_reports_keep_output_execution_and_later_commands_visible() {
+        let body = "import json\nprint(json.dumps({'rule': 'system.services:reboot'}))\n";
+        for command in [
+            format!("python3 - <<'PY' | sh\n{body}PY"),
+            format!("python3 -c 'exec(input())' <<'PY'\n{body}PY"),
+            format!("python3 /tmp/unknown.py <<'PY'\n{body}PY"),
+            format!("python3 - <<PY\n{body}PY"),
+            format!("python3 - <<'PY' > /tmp/report.sh\n{body}PY\nsh /tmp/report.sh"),
+        ] {
+            assert!(
+                mask_non_executing_heredocs(&command).contains("system.services:reboot"),
+                "{command}"
+            );
+        }
+        let command = format!("python3 - <<'PY'\n{body}PY\nreboot");
+        assert!(mask_non_executing_heredocs(&command).ends_with("\nreboot"));
     }
 
     /// #136 REVERTED: a python (or any interpreter) heredoc body is NOT masked —

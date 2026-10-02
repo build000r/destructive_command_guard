@@ -1760,6 +1760,8 @@ fn publish_decisive_response(
 fn print_version() {
     // Machine-readable version on stdout (for scripts, installers, etc.)
     emit_stdout!("{PKG_VERSION}");
+    // Distinguish the operator's bounded report-parser release from upstream.
+    emit_stdout!("Operator patch: report-literals-1");
 
     // ASCII art logo - compact shield design
     emit_stderr!();
