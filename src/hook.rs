@@ -2373,10 +2373,16 @@ fn segment_is_format_drive_invocation(segment: &str) -> bool {
 /// argument (`rm -Recurse -Force …`, `del /s /q …`), or a cmd writer carrying a
 /// Windows path (`copy nul .git\config`).
 fn command_has_powershell_shape(command: &str) -> bool {
+    let mut segment_start = 0;
+    let mut interpreter_bodies = None;
     command
         .split(['|', ';', '&', '\n', '\r', '(', '{'])
         .any(|segment| {
-            segment
+            let segment_range = segment_start..segment_start + segment.len();
+            // Every separator above is one ASCII byte. Keep original offsets
+            // so a body can never hide a trigger after its terminator.
+            segment_start = segment_range.end.saturating_add(1);
+            let windows_shape = segment
                 .split_whitespace()
                 .next()
                 .is_some_and(is_powershell_cmdlet_token)
@@ -2385,7 +2391,22 @@ fn command_has_powershell_shape(command: &str) -> bool {
                 || segment_is_windows_file_delete_invocation(segment)
                 || segment_is_windows_only_executable(segment)
                 || segment_command_word_is_cmd_assembled(segment)
-                || segment_is_format_drive_invocation(segment)
+                || segment_is_format_drive_invocation(segment);
+            if !windows_shape {
+                return false;
+            }
+            // A Python regex caret is not cmd.exe assembly. Reuse the bounded
+            // AST ownership proof, lazily and once, only for dialect inference.
+            // The original body still reaches all interpreter/evaluator checks.
+            let bodies = interpreter_bodies.get_or_insert_with(|| {
+                crate::heredoc::quoted_non_shell_heredoc_ranges(
+                    command,
+                    crate::heredoc::ExtractionLimits::structural_scan().max_heredocs,
+                )
+            });
+            !bodies
+                .iter()
+                .any(|body| body.start <= segment_range.start && segment_range.end <= body.end)
         })
 }
 
@@ -4608,6 +4629,172 @@ mod tests {
             refine_shell_dialect("Remove-Item x", ShellDialect::Unknown),
             ShellDialect::Unknown
         );
+    }
+
+    fn interpreter_stdin_dialect_evaluate(command: &str) -> crate::evaluator::EvaluationResult {
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }))
+        .unwrap();
+        let extracted = extract_command_with_context(&input).expect("Bash command");
+        assert_eq!(
+            extracted.command, command,
+            "inference must not mask evaluator input"
+        );
+        let config = crate::config::Config::default();
+        let mut enabled = config
+            .packs
+            .enabled_pack_ids_for_payload(command_is_windows_shell_payload(command));
+        // Exercise Windows matching even on non-Windows test hosts; the hook's
+        // inferred dialect must prevent cross-language reinterpretation.
+        enabled.insert("windows.filesystem".to_owned());
+        enabled.insert("containers.docker".to_owned());
+        let registry = &crate::packs::REGISTRY;
+        let keywords = registry.collect_enabled_keywords(&enabled);
+        let ordered = registry.expand_enabled_ordered(&enabled);
+        let index = registry.build_enabled_keyword_index(&ordered);
+        crate::evaluator::evaluate_command_with_pack_order_at_path_in_dialect(
+            &extracted.command,
+            &keywords,
+            &ordered,
+            index.as_ref(),
+            &config.overrides.compile(),
+            &crate::allowlist::LayeredAllowlist::default(),
+            &config.heredoc_settings(),
+            None,
+            extracted.dialect,
+        )
+    }
+
+    #[test]
+    fn interpreter_stdin_dialect_long_python_regex_keeps_posix() {
+        let command = format!(
+            "python3 - <<'PY'\nimport re\nline=re.compile(r'(?m)^enabled')\n{}PY\n",
+            "print('report')\n".repeat(140)
+        );
+        assert_eq!(
+            refine_shell_dialect(&command, ShellDialect::Posix),
+            ShellDialect::Posix
+        );
+        assert!(!command_is_windows_shell_payload(&command));
+        let result = interpreter_stdin_dialect_evaluate(&command);
+        assert!(
+            !result.is_denied(),
+            "quoted Python regex is not Windows syntax: {result:?}"
+        );
+    }
+
+    #[test]
+    fn interpreter_stdin_dialect_config_preview_preserves_full_python_source() {
+        // Portable analogue of the rejected config preview: the snippets are
+        // classifier inputs only, never executed as Python or shell commands.
+        let command = concat!(
+            "python3 - <<'PY'\n",
+            "import tomllib,re,json,hashlib\n",
+            "raw=b'[integrations.caam]\\nenabled = false\\nauto_failover = false\\n'\n",
+            "old=tomllib.loads(raw.decode());assert old['integrations']['caam']['enabled'] is False\n",
+            "text=raw.decode();section=re.compile(r'(?ms)^\\[integrations\\.caam\\][ \\t]*(?:#[^\\n]*)?\\n.*?(?=^\\[|\\Z)')\n",
+            "matches=section.findall(text);assert len(matches)==1\n",
+            "line=re.compile(r'(?m)^[ \\t]*enabled[ \\t]*=[ \\t]*false[ \\t]*(?:#[^\\n]*)?(?:\\n|$)')\n",
+            "new=section.sub(lambda m:line.sub('',m.group()),text).encode()\n",
+            "expected=tomllib.loads(raw.decode());del expected['integrations']['caam']['enabled']\n",
+            "assert tomllib.loads(new.decode())==expected\n",
+            "result={'ok':True,'old_sha256':hashlib.sha256(raw).hexdigest(),'new_sha256':hashlib.sha256(new).hexdigest()}\n",
+            "print(json.dumps(result,indent=2))\n",
+            "PY\n",
+        );
+        assert_eq!(
+            refine_shell_dialect(command, ShellDialect::Posix),
+            ShellDialect::Posix
+        );
+        assert!(!command_is_windows_shell_payload(command));
+        let result = interpreter_stdin_dialect_evaluate(command);
+        assert!(
+            !result.is_denied(),
+            "config preview must reach Python analysis unchanged: {result:?}"
+        );
+    }
+
+    #[test]
+    fn interpreter_stdin_dialect_uncertain_receivers_still_widen() {
+        for header in [
+            "python3 - <<PY",
+            "bash <<'PY'",
+            "sh <<'PY'",
+            "unknown - <<'PY'",
+            "env python3 - <<'PY'",
+            "\"bash\" -s python3 <<'PY'",
+            "/tmp/runner python3 <<'PY'",
+            "\"$runner\" python3 <<'PY'",
+            "$(printf bash) python3 <<'PY'",
+            "python3 - | bash <<'PY'",
+            "true && \"bash\" -s python3 <<'PY'",
+            "<<'PY' python3",
+            "./python3 - <<'PY'",
+            "/tmp/python - <<'PY'",
+            "./python - <<'PY'",
+            "python3() { bash -s; }\npython3 - <<'PY'",
+            "alias python3='bash -s'\npython3 - <<'PY'",
+        ] {
+            let command = format!("{header}\nre.compile(r'(?m)^enabled')\nPY\n");
+            assert_eq!(
+                refine_shell_dialect(&command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "unproven ownership must not suppress shell inference: {command}"
+            );
+            assert!(command_is_windows_shell_payload(&command));
+        }
+    }
+
+    #[test]
+    fn interpreter_stdin_dialect_windows_commands_outside_body_still_deny() {
+        for windows in [
+            r"d^el /s /q C:\important",
+            r"del /s /q C:\important",
+            r"Remove-Item -Recurse -Force C:\important",
+            r"Remove-Item @options",
+            "doc^ker system prune -af",
+        ] {
+            for command in [
+                windows.to_owned(),
+                format!("python3 - <<'PY'\nprint('report')\nPY\n{windows}"),
+            ] {
+                assert_eq!(
+                    refine_shell_dialect(&command, ShellDialect::Posix),
+                    ShellDialect::Unknown
+                );
+                assert!(command_is_windows_shell_payload(&command));
+                let result = interpreter_stdin_dialect_evaluate(&command);
+                assert!(
+                    result.is_denied(),
+                    "real Windows commands remain guarded: {command}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interpreter_stdin_dialect_late_python_destructive_calls_still_deny() {
+        for destructive in [
+            "import shutil\nshutil.rmtree('/important')\n",
+            "import os\nos.remove('/important')\n",
+            "import subprocess\nsubprocess.run(['powershell', '-Command', 'Remove-Item -Recurse -Force C:\\\\important'])\n",
+        ] {
+            let command = format!(
+                "python3 - <<'PY'\nimport re\nline=re.compile(r'(?m)^enabled')\n{}{destructive}PY\n",
+                "print('report')\n".repeat(140)
+            );
+            assert_eq!(
+                refine_shell_dialect(&command, ShellDialect::Posix),
+                ShellDialect::Posix
+            );
+            let result = interpreter_stdin_dialect_evaluate(&command);
+            assert!(
+                result.is_denied(),
+                "the interpreter body must still be analyzed: {result:?}"
+            );
+        }
     }
 
     /// Cmd *writers* must widen the dialect the way cmd *deleters* already do.

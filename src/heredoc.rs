@@ -6086,16 +6086,16 @@ pub(crate) fn is_literal_perl_print_heredoc(command: &str, operator: Range<usize
 
 /// AST-proven quoted stdin owned by a concrete non-shell interpreter. This
 /// does NOT mark the program safe: the complete body is still analyzed. It
-/// only permits a proven literal print argument to retain its program owner.
-/// Shells, expanding bodies and overridden receivers
-/// retain the old conservative scan.
+/// permits a proven literal print argument to retain its program owner, and
+/// keeps interpreter input out of outer-shell dialect inference. Shells,
+/// expanding bodies and overridden receivers retain the old conservative scan.
 ///
 /// Do not call `active_heredocs` or the fallback-capable override helper here:
 /// their recovery paths call this extractor. A single direct parse avoids that
 /// cycle, and a parse error supplies no exemption. The caller caches the result;
 /// at most the extraction quota's worth of name-override walks can be required.
-fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usize>> {
-    if command.len() > 256 * 1024 {
+pub(crate) fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usize>> {
+    if !command.contains("<<") || command.len() > 256 * 1024 {
         return Vec::new();
     }
     let ast = AstGrep::new(command, SupportLang::Bash);
@@ -6116,15 +6116,18 @@ fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usi
         else {
             continue;
         };
-        let Some((target, wrapped)) =
-            extract_heredoc_target_resolution(command, heredoc.operator_start)
-        else {
+        let Some(target) = ast_heredoc_receiver(ast.root(), heredoc.operator_start) else {
             continue;
         };
-        if wrapped || !is_non_shell_interpreter_stdin_command(&target) {
+        if !is_non_shell_interpreter_stdin_command(&target) {
             continue;
         }
         let basename = target.rsplit(['/', '\\']).next().unwrap_or(&target);
+        if (target.contains(['/', '\\']) && !is_trusted_os_data_sink_path(&target, basename))
+            || std::env::var_os(format!("BASH_FUNC_{basename}%%")).is_some()
+        {
+            continue;
+        }
         let mut overridden = false;
         let mut override_parse_error = false;
         find_shell_name_override_deep(
@@ -6138,6 +6141,44 @@ fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usi
         }
     }
     ranges
+}
+
+/// The actual AST command name owning this redirect, never a later argv word.
+/// Lexical target recovery is deliberately more permissive for extraction, so
+/// it cannot establish a receiver exemption (a wrapper may take `python3` as an
+/// argument). Unknown, quoted or dynamic names keep conservative treatment.
+#[allow(clippy::needless_pass_by_value)]
+fn ast_heredoc_receiver<D: ast_grep_core::Doc>(
+    root: ast_grep_core::Node<'_, D>,
+    operator_start: usize,
+) -> Option<String> {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "heredoc_redirect" {
+            if node.range().start + node.text().find("<<")? != operator_start {
+                continue;
+            }
+            let statement = node.parent()?;
+            if statement.kind() != "redirected_statement" {
+                return None;
+            }
+            let first = statement.children().find(ast_grep_core::Node::is_named)?;
+            let owner = match first.kind().as_ref() {
+                "command" => first,
+                "list" | "pipeline" => first
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .last()?,
+                _ => return None,
+            };
+            if owner.kind() != "command" {
+                return None;
+            }
+            return Some(owner.field("name")?.text().into_owned());
+        }
+        pending.extend(node.children());
+    }
+    None
 }
 
 /// Extract the command that receives a heredoc or here-string.
@@ -6628,60 +6669,65 @@ fn quoted_heredoc_bodies_blanked(command: &str) -> Option<String> {
 /// behavior was "never mask", so every extra flag is mere conservatism.
 #[allow(clippy::needless_pass_by_value)]
 fn find_shell_name_override_deep<D: ast_grep_core::Doc>(
-    node: ast_grep_core::Node<'_, D>,
+    root: ast_grep_core::Node<'_, D>,
     target: &str,
     overridden: &mut bool,
     parse_error: &mut bool,
 ) {
-    if *overridden || *parse_error {
-        return;
-    }
-    match node.kind().as_ref() {
-        "ERROR" => {
-            *parse_error = true;
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if *overridden || *parse_error {
             return;
         }
-        "function_definition" => {
-            let Some(name) = node.field("name") else {
-                *overridden = true;
-                return;
-            };
-            let name = name.text();
-            if name.as_ref() == target || !is_static_shell_name(name.as_ref()) {
-                *overridden = true;
+        match node.kind().as_ref() {
+            "ERROR" => {
+                *parse_error = true;
                 return;
             }
-        }
-        "variable_assignment" => {
-            let text = node.text();
-            if shell_assignment_name(text.as_ref()) == Some("PATH") {
-                *overridden = true;
-                return;
-            }
-        }
-        "command" => {
-            let text = node.text();
-            match shell_words::split(text.as_ref()) {
-                Ok(tokens) => {
-                    if shell_command_may_override_name(&tokens, target) {
-                        *overridden = true;
-                        return;
-                    }
-                    // Unlike the prefix walker, fall through and keep
-                    // descending: nested substitutions share fate with the
-                    // heredoc receiver when they enclose it.
-                }
-                Err(_) => {
-                    *parse_error = true;
+            "function_definition" => {
+                let Some(name) = node.field("name") else {
+                    *overridden = true;
+                    return;
+                };
+                let name = name.text();
+                if name.as_ref() == target || !is_static_shell_name(name.as_ref()) {
                     *overridden = true;
                     return;
                 }
             }
+            "variable_assignment" => {
+                let text = node.text();
+                if shell_assignment_name(text.as_ref()) == Some("PATH") {
+                    *overridden = true;
+                    return;
+                }
+            }
+            "command" => {
+                let text = node.text();
+                match shell_words::split(text.as_ref()) {
+                    Ok(tokens) => {
+                        if shell_command_may_override_name(&tokens, target) {
+                            *overridden = true;
+                            return;
+                        }
+                        // Unlike the prefix walker, fall through and keep
+                        // descending: nested substitutions share fate with the
+                        // heredoc receiver when they enclose it.
+                    }
+                    Err(_) => {
+                        *parse_error = true;
+                        *overridden = true;
+                        return;
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    for child in node.children() {
-        find_shell_name_override_deep(child, target, overridden, parse_error);
+        // Like the structural heredoc walk, this can see long left-nested lists
+        // before the hook size gate. Keep traversal off the native call stack.
+        let first_child = pending.len();
+        pending.extend(node.children());
+        pending[first_child..].reverse();
     }
 }
 
@@ -15293,6 +15339,54 @@ EOF";
 
     mod inert_interpreter_stdin {
         use super::*;
+
+        #[test]
+        fn quoted_non_shell_ranges_require_the_same_receiver_provenance() {
+            for header in [
+                "python3 - <<'PY'",
+                "/usr/bin/python3 - <<'PY'",
+                "true && python3 - <<'PY'",
+                "printf data | python3 - <<'PY'",
+            ] {
+                let command = format!("{header}\nprint('report')\nPY\n");
+                let ranges = quoted_non_shell_heredoc_ranges(&command, 10);
+                assert_eq!(ranges.len(), 1, "{command}");
+                assert!(range_is_inert_interpreter_stdin(&command, &ranges[0]));
+            }
+            for header in [
+                "/tmp/python - <<'PY'",
+                "./python - <<'PY'",
+                "/usr/local/bin/python3 - <<'PY'",
+                "env python3 - <<'PY'",
+                "\"bash\" -s python3 <<'PY'",
+                "/tmp/runner python3 <<'PY'",
+                "\"$runner\" python3 <<'PY'",
+                "$(printf bash) python3 <<'PY'",
+                "python3 - | bash <<'PY'",
+                "true && \"bash\" -s python3 <<'PY'",
+                "<<'PY' python3",
+                "python3 - <<PY",
+                "bash <<'PY'",
+                "python3() { bash -s; }\npython3 - <<'PY'",
+                "alias python3='bash -s'\npython3 - <<'PY'",
+            ] {
+                let command = format!("{header}\nprint('report')\nPY\n");
+                assert!(
+                    quoted_non_shell_heredoc_ranges(&command, 10).is_empty(),
+                    "{command}"
+                );
+            }
+        }
+
+        #[test]
+        fn quoted_non_shell_ranges_handle_deep_command_lists_iteratively() {
+            let command = format!(
+                "{}python3 - <<'PY'\nre.compile(r'(?m)^enabled')\nPY\n",
+                "true && ".repeat(10_000)
+            );
+            let ranges = quoted_non_shell_heredoc_ranges(&command, 10);
+            assert_eq!(ranges.len(), 1);
+        }
 
         /// Ask the predicate about the span of `needle` inside `command`.
         fn needle_is_inert(command: &str, needle: &str) -> bool {
