@@ -1171,8 +1171,20 @@ pub(crate) fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
 /// This is designed to be be used on the hot path, so it returns a borrowed view
 /// when no sanitization is required.
 #[must_use]
-#[allow(clippy::too_many_lines)] // Single-pass masking logic; refactor only if it becomes unreadable
 pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
+    sanitize_data_arguments(command, false)
+}
+
+/// Mask only inert search patterns when deciding whether a Bash label conflicts
+/// with Windows shell syntax. Other argument data stays visible: dialect
+/// inference must not apply the full POSIX sanitizer to uncertain shell text.
+#[must_use]
+pub(crate) fn sanitize_search_patterns_for_dialect(command: &str) -> Cow<'_, str> {
+    sanitize_data_arguments(command, true)
+}
+
+#[allow(clippy::too_many_lines)] // Shared token ownership and flag handling.
+fn sanitize_data_arguments(command: &str, search_only: bool) -> Cow<'_, str> {
     // Quick-reject: if no safe-registry commands appear in the input AND no comments,
     // no masking is possible. Skip expensive tokenization entirely. This is a significant
     // optimization for heredocs and other large inputs that don't use these commands.
@@ -1196,6 +1208,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     let mut pending_safe_flag: Option<PendingSafeFlag<'_>> = None; // Safe flag waiting for value(s)
     let mut options_ended = false;
     let mut search_pattern_masked = false;
+    let mut search_executable_value_pending = false;
     let mut wrapper: WrapperState = WrapperState::None;
     let mut command_query_mode = false;
     let mut search_cmd_override: Option<&str> = None;
@@ -1221,6 +1234,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             pending_safe_flag = None;
             options_ended = false;
             search_pattern_masked = false;
+            search_executable_value_pending = false;
             wrapper = WrapperState::None;
             command_query_mode = false;
             search_cmd_override = None;
@@ -1233,7 +1247,9 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         }
 
         if token.kind == SanitizeTokenKind::Comment {
-            mask_ranges.push(token.byte_range.clone());
+            if !search_only {
+                mask_ranges.push(token.byte_range.clone());
+            }
             continue;
         }
 
@@ -1248,7 +1264,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
 
         if command_query_mode {
             // `command -v/-V` is query-only; treat all remaining args as data.
-            if !token.has_inline_code {
+            if !search_only && !token.has_inline_code {
                 mask_ranges.push(token.byte_range.clone());
             }
             continue;
@@ -1306,6 +1322,20 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             // but fail open for safety.
             continue;
         };
+
+        if search_only && !matches!(cmd.rsplit('/').next(), Some("rg" | "grep" | "ag" | "ack")) {
+            continue;
+        }
+        if search_only && search_executable_value_pending {
+            search_executable_value_pending = false;
+            continue;
+        }
+        if search_only && cmd.rsplit('/').next() == Some("rg") && token_text == "--pre" {
+            // rg executes this value as a preprocessor. It is not the first
+            // positional search pattern, even when it is quoted.
+            search_executable_value_pending = true;
+            continue;
+        }
 
         let mut is_git_subcommand_token = false;
         if cmd == "git" && git_subcommand.is_none() {

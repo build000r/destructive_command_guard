@@ -3918,6 +3918,7 @@ fn path_is_safe_unquoted(path: &str) -> bool {
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
         .is_some_and(temp_path_suffix_is_static_unquoted)
+        || darwin_user_temp_suffix(path).is_some_and(temp_path_suffix_is_static_unquoted)
         || windows_literal_user_temp_subpath(path)
 }
 
@@ -3929,7 +3930,31 @@ fn path_is_safe_double_quoted(path: &str) -> bool {
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
         .is_some_and(temp_path_suffix_is_static_double_quoted)
+        || darwin_user_temp_suffix(path).is_some_and(temp_path_suffix_is_static_double_quoted)
         || windows_literal_user_temp_subpath(path)
+}
+
+/// Darwin's literal per-user temporary directory, including its canonical
+/// `/private` spelling. Only descendants of the `T` directory qualify: cache
+/// (`C`), persistent (`0`) and parent directories are not temporary cleanup.
+/// The fixed system-generated bucket/identity grammar cannot contain shell
+/// expansion, traversal or a caller-selected replacement for the temp root.
+fn darwin_user_temp_suffix(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("/var/folders/")
+        .or_else(|| path.strip_prefix("/private/var/folders/"))?;
+    let (bucket, rest) = rest.split_once('/')?;
+    let (identity, rest) = rest.split_once('/')?;
+    let valid_component = |value: &str, length| {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    };
+    if !valid_component(bucket, 2) || !valid_component(identity, 30) {
+        return None;
+    }
+    rest.strip_prefix("T/")
 }
 
 /// Literal per-user Windows temp subpaths (#285), the Windows counterpart of
@@ -7994,6 +8019,40 @@ mod tests {
         // Traversal out of the private tmp tree stays blocked.
         assert!(pack.check("rm -rf /private/tmp/../etc").is_some());
         assert!(pack.check("rm -rf /private/etc").is_some());
+    }
+
+    #[test]
+    fn darwin_user_temp_subpaths_are_equivalent_to_tmp() {
+        let pack = create_pack();
+        let root = "/var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/T";
+        for command in [
+            format!("rm -r {root}/dsr-release-test-kBGTia"),
+            format!("rm -rf /private{root}/fixture"),
+            format!("rm -r -- /private{root}/fixture/cache"),
+            format!("rm -rf \"{root}/fixture with spaces\""),
+        ] {
+            assert!(pack.check(&command).is_none(), "must allow: {command}");
+        }
+        for command in [
+            format!("rm -r {root}"),
+            format!("rm -rf {root}/"),
+            format!("rm -rf {root}/./"),
+            format!("rm -rf {root}/../C"),
+            format!("rm -rf {root}/fixture/../../0"),
+            format!("rm -rf {root}x/fixture"),
+            format!("rm -rf {root}/$TARGET"),
+            format!("rm -rf \"{root}/$(pwd)\""),
+            format!("rm -r {root}/fixture /Users/b/source"),
+            format!("rm -rf {}C/fixture", root.trim_end_matches('T')),
+            format!("rm -rf {}0/fixture", root.trim_end_matches('T')),
+            "rm -rf /var/folders/*/*/T/fixture".to_string(),
+            "rm -rf /var/folders/../wbfkx0p10fx29kmd2z1hhfzw0000gn/T/fixture".to_string(),
+            "rm -rf /var/folders/m_/short/T/fixture".to_string(),
+            "rm -rf /var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/T".to_string(),
+            "rm -rf $TMPDIR/fixture".to_string(),
+        ] {
+            assert!(pack.check(&command).is_some(), "must deny: {command}");
+        }
     }
 
     #[test]

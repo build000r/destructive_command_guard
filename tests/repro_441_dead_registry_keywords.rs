@@ -141,6 +141,38 @@ fn the_added_keywords_do_not_deny_ordinary_commands() {
 }
 
 #[test]
+fn bash_search_pattern_pipes_preserve_the_native_hook_dialect() {
+    let command = "rg -n 'SIGTERM|signal|drain|shutdown|serve_forever|server_close|Threading|service.lock|recovery' scripts/fresh-box-custody-executor.py scripts/fresh-box-drill-cleanup.py && rg -n '^def .*install|^def .*apply|bootout|bootstrap|launchctl|active' scripts/fresh-box-drill-cleanup.py | tail -55";
+    assert_eq!(decision(command, "system.services"), "allow");
+    for command in [
+        "rg 'signal|^def' source; shutdown -h now",
+        "rg 'signal|^def' source && reboot",
+        "rg \"$(shutdown -h now)\" source",
+        "rg \"`shutdown -h now`\" source",
+    ] {
+        assert_eq!(decision(command, "system.services"), "deny", "{command}");
+    }
+}
+
+#[test]
+fn darwin_literal_temp_cleanup_stays_bounded_through_native_hook() {
+    for command in [
+        "rm -r /var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/T/dsr-release-test-kBGTia",
+        "rm -r -- /private/var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/T/fixture/cache",
+    ] {
+        assert_eq!(decision(command, "core.filesystem"), "allow", "{command}");
+    }
+    for command in [
+        "rm -r /var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/T",
+        "rm -r /private/var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/C/fixture",
+        "rm -r /private/var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/T/../0",
+        "rm -r /var/folders/m_/wbfkx0p10fx29kmd2z1hhfzw0000gn/T/fixture /Users/b/source",
+    ] {
+        assert_eq!(decision(command, "core.filesystem"), "deny", "{command}");
+    }
+}
+
+#[test]
 fn mongo_shell_methods_and_kubectl_kustomize_are_reachable() {
     // Neither shape names a client binary or the word "kustomize", which is all
     // their registry rows used to carry. Both were the root cause of the two

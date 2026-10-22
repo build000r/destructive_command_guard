@@ -2436,7 +2436,12 @@ pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialec
     // Everything outside the body is still judged, so a genuinely mislabeled
     // `Remove-Item -Recurse -Force` is down-trusted exactly as before.
     let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
-    if command_has_powershell_shape(visible.as_ref()) {
+    // A regex alternative is not a Bash pipeline. Honor proven search-argument
+    // ownership before splitting candidate Windows statements. This applies
+    // only to a POSIX-labeled payload; unknown/explicit Windows activation keeps
+    // its original view. Substitutions and executable segments stay visible.
+    let search_data = crate::context::sanitize_search_patterns_for_dialect(visible.as_ref());
+    if command_has_powershell_shape(search_data.as_ref()) {
         ShellDialect::Unknown
     } else {
         labeled
@@ -4910,6 +4915,37 @@ mod tests {
                 refine_shell_dialect(command, ShellDialect::Posix),
                 ShellDialect::Posix,
                 "a caret outside the command word must not widen: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_pattern_alternatives_do_not_infer_windows_commands() {
+        for command in [
+            "rg -n 'shutdown|^def install|^def apply' scripts/ | tail -55",
+            "rg -n 'shutdown|signal' scripts/ && rg -n '^def install|^def apply' scripts/ | tail -55",
+            "grep -E 'signal|Remove-Item|^def' source",
+            "rg -e 'signal|^def' --regexp='shutdown|Stop-Computer' source",
+            "rg -e'signal|^def' source",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "inert search pattern must preserve Bash dialect: {command}"
+            );
+        }
+        for command in [
+            "rg 'signal|^def' source; Remove-Item -Recurse -Force C:\\data",
+            "rg 'signal|^def' source && doc^ker system prune -af",
+            "rg \"$(Remove-Item -Recurse -Force C:\\data)\" source",
+            "rg --pre 'filter|Remove-Item -Recurse -Force C:\\data' pattern source",
+            "rg --pre='filter|Remove-Item -Recurse -Force C:\\data' pattern source",
+            "unknown 'signal|Remove-Item -Recurse -Force C:\\data'",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "executable or unknown text must still widen: {command}"
             );
         }
     }
