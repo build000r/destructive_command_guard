@@ -17,5 +17,5 @@ BLOCKED: Destructive Command Detected
   Regex: ^rm\s+-rf
 
   Safe alternatives:
-    - mv /prod /tmp/prod.backup
-    - Ask the user to run the command manually
+    - ls -la /prod
+    - Retain blocked state in place and report the exact action

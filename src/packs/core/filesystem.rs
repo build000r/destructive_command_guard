@@ -23,86 +23,16 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
         "ls -la {path}",
         "List directory contents to verify the path",
     ),
-    PatternSuggestion::new(
-        "rm -rf /tmp/<subdir>",
-        "Scope deletion to a disposable temp path — dcg allows literal /tmp targets without confirmation",
-    ),
-    PatternSuggestion::gated(
-        "rm -rf <specific-subdirectory>",
-        "A specific non-temp path is safer than root/home but still a recursive delete, so it needs approval",
-    ),
 ];
 
 /// Suggestions for general `rm -rf` pattern.
-const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
-        "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
-    ),
-    PatternSuggestion::with_platform(
-        "trash-put {path}",
-        "Move to trash instead of permanent deletion (requires trash-cli)",
-        Platform::Linux,
-    ),
-    PatternSuggestion::with_platform(
-        "gio trash {path}",
-        "Move to trash via GNOME (requires gio)",
-        Platform::Linux,
-    ),
-    PatternSuggestion::with_platform(
-        "mv {path} ~/.Trash/",
-        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
-        Platform::MacOS,
-    ),
-    PatternSuggestion::new(
-        "mv {path} /tmp/delete-me-{timestamp}",
-        "Move to a temp holding area instead of deleting immediately",
-    ),
-    PatternSuggestion::new(
-        "rm -rf /tmp/{subdir}",
-        "Safe temp directory deletion (allowed without confirmation)",
-    ),
-    PatternSuggestion::new(
-        "find {path} -type f | wc -l",
-        "Count files that would be deleted before proceeding",
-    ),
-    PatternSuggestion::new(
-        "ls -la {path}",
-        "List directory contents to verify the path",
-    ),
-];
+const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = RM_RECURSIVE_SUGGESTIONS;
 
 /// Suggestions for `rm -r -f` (separate flags) pattern.
-const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
-        "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
-    ),
-    PatternSuggestion::new(
-        "rm -r -f /tmp/{subdir}",
-        "Safe temp directory deletion (allowed without confirmation)",
-    ),
-    PatternSuggestion::new(
-        "find {path} -type f | head -20",
-        "Preview files before deletion",
-    ),
-];
+const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = RM_RECURSIVE_SUGGESTIONS;
 
 /// Suggestions for `rm --recursive --force` (long flags) pattern.
-const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
-        "rm --interactive --recursive {path}",
-        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
-    ),
-    PatternSuggestion::new(
-        "find {path} -maxdepth 2 -ls | head -30",
-        "Preview directory structure before deletion",
-    ),
-    PatternSuggestion::new(
-        "rm --recursive --force /tmp/{subdir}",
-        "Safe temp directory deletion (allowed without confirmation)",
-    ),
-];
+const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = RM_RECURSIVE_SUGGESTIONS;
 
 /// Suggestions for `find ... -delete` patterns. `find -delete` is
 /// bytewise-equivalent to `rm -rf` on the matching tree, so the suggestions
@@ -366,7 +296,7 @@ use crate::normalize::{
 use std::ops::Range;
 
 const RM_RF_ROOT_HOME_NAME: &str = "rm-rf-root-home";
-const RM_RF_ROOT_HOME_REASON: &str = "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.";
+const RM_RF_ROOT_HOME_REASON: &str = "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed without review of the exact target and authorization.";
 const RM_R_F_SEPARATE_ROOT_HOME_NAME: &str = "rm-r-f-separate-root-home";
 const RM_R_F_SEPARATE_ROOT_HOME_REASON: &str =
     "rm with separate -r -f flags targeting root or home is EXTREMELY DANGEROUS.";
@@ -374,7 +304,7 @@ const RM_RECURSIVE_FORCE_ROOT_HOME_NAME: &str = "rm-recursive-force-root-home";
 const RM_RECURSIVE_FORCE_ROOT_HOME_REASON: &str =
     "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.";
 const RM_RF_GENERAL_NAME: &str = "rm-rf-general";
-const RM_RF_GENERAL_REASON: &str = "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.";
+const RM_RF_GENERAL_REASON: &str = "rm -rf is destructive and requires review of the exact target, reason, and explicit authorization.";
 const RM_R_F_SEPARATE_NAME: &str = "rm-r-f-separate";
 const RM_R_F_SEPARATE_REASON: &str =
     "rm with separate -r -f flags is destructive and requires human approval.";
@@ -411,30 +341,12 @@ const RM_PROTECTED_FILE_REASON: &str = "rm on a protected credential or login-st
 /// Suggestions for a recursive `rm` that carries no force flag.
 const RM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
-        "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
-    ),
-    PatternSuggestion::with_platform(
-        "trash-put {path}",
-        "Move to trash instead of permanent deletion (requires trash-cli)",
-        Platform::Linux,
-    ),
-    PatternSuggestion::with_platform(
-        "mv {path} ~/.Trash/",
-        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
-        Platform::MacOS,
-    ),
-    PatternSuggestion::new(
-        "mv {path} /tmp/delete-me-{timestamp}",
-        "Move the tree aside instead of deleting it; remove the holding copy after review",
-    ),
-    PatternSuggestion::new(
-        "rm -r /tmp/{subdir}",
-        "Safe temp directory deletion (allowed without confirmation)",
+        "ls -ld -- {path}",
+        "Inspect the exact target and its ownership before reviewing removal",
     ),
     PatternSuggestion::new(
         "ls -la {path}",
-        "List directory contents to verify the path",
+        "Review contents and preserve unique work; retain the target in place while deletion remains blocked",
     ),
 ];
 
@@ -566,12 +478,10 @@ const RM_RECURSIVE_GENERAL_EXPLANATION: &str = "rm -r deletes a directory and ev
      hook. Everything the process can unlink, it unlinks, and there is no undo.\n\n\
      dcg auto-allows recursive deletion only for literal temp paths:\n  \
      rm -r /tmp/<subdir>/scratch\n\n\
-     For any other directory, preview first, then either delete interactively or move \
-     the tree aside (dcg allows both forms):\n  \
-     ls -la /path/to/directory\n  \
-     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
-     mv /path/to/directory /tmp/delete-me-<literal-timestamp>\n\n\
-     The trash directory is ~/.Trash on macOS and ~/.local/share/Trash on Linux.";
+     Inspect the exact target with ls -la /path/to/directory. Review unique work, \
+     active consumers, and the reason for removal before using any scoped authorization \
+     offered by this denial. While blocked, retain the target in place and report the \
+     exact action; do not create a holding copy or move it to another deletion path.";
 
 const RM_RECURSIVE_ROOT_HOME_EXPLANATION: &str = "A recursive rm rooted at /, ~, or $HOME removes the account or the machine, and \
      leaving off -f changes nothing about that: -f decides whether errors are reported, \
@@ -584,11 +494,9 @@ const RM_RECURSIVE_ROOT_HOME_EXPLANATION: &str = "A recursive rm rooted at /, ~,
      rm -r ~                          # never this\n\n\
      dcg auto-allows recursive deletion only for literal temp paths:\n  \
      rm -r /tmp/<subdir>/scratch\n\n\
-     For a specific directory, preview first, then either delete interactively or move \
-     the tree aside (dcg allows both forms):\n  \
-     ls -la /path/to/directory\n  \
-     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
-     mv /path/to/directory /tmp/delete-me-<literal-timestamp>";
+     Inspect a specific intended target with ls -la /path/to/directory. A narrower \
+     path still needs its own review and explicit authorization. Retain blocked state \
+     in place; do not relocate the root or home contents to make deletion pass.";
 
 const RM_RECURSIVE_UNVERIFIED_EXPLANATION: &str = "The command word is resolved at run time, so dcg cannot read which binary will \
      run, and the arguments beside it are recursive deletion syntax. A find -exec \
@@ -4943,7 +4851,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "rm-rf-root-home",
             r#"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
-            "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
+            "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed without review of the exact target and authorization.",
             Critical,
             "This command would recursively delete files starting from the root filesystem (/) \
              or home directory (~). This is catastrophic and will destroy:\n\n\
@@ -4955,15 +4863,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              takes hours to days.\n\n\
              dcg auto-allows recursive deletion only for literal temp paths:\n  \
              rm -rf /tmp/<subdir>/scratch\n\n\
-             For any other directory, preview first, then either delete interactively \
-             or move the tree aside (dcg allows all three forms):\n  \
-             find /path/to/directory -type f | head -20\n  \
-             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
-             mv /path/to/directory ~/.Trash/            # macOS soft-delete, recoverable\n  \
-             mv /path/to/directory ~/.local/share/Trash/ # Linux soft-delete, recoverable\n\n\
-             Under a home directory, prefer the Trash move: relocating into /tmp is \
-             itself denied there (`mv-sensitive-source-root-home`), because \
-             relocate-then-delete is the bypass that rule exists to stop.",
+             Inspect the exact intended target with ls -la /path/to/directory. \
+             Review unique work and active consumers, and establish explicit authorization \
+             for that exact action. Retain blocked state in place; do not move or copy \
+             root or home contents to another deletion path.",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
@@ -4979,11 +4882,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Separate `-r -f` flags on `/` or `~` have identical effect to `rm -rf /`: \
              recursive, forced, silent deletion of the entire filesystem or home directory.\n\n\
              There is NO recovery without backups. Run only if truly intended.\n\n\
-             For a specific directory, preview first, then either delete interactively \
-             or move the tree aside (dcg allows both forms):\n  \
-             ls -la /path/to/directory\n  \
-             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
-             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
+             Inspect a specific intended target with ls -la /path/to/directory. \
+             A narrower target still needs review and explicit authorization. Keep \
+             blocked state in place and report the exact action and reason.",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with LONG flags
@@ -4995,18 +4896,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             Critical,
             "The long-flag form has identical effect to `rm -rf /`: recursive, forced, \
              silent deletion. Run only if truly intended.\n\n\
-             For a specific directory, preview first, then either delete interactively \
-             or move the tree aside (dcg allows both forms):\n  \
-             ls -la /path/to/directory\n  \
-             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
-             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
+             Inspect a specific intended target with ls -la /path/to/directory. \
+             Review the target, unique work, active consumers, and explicit authorization; \
+             leave blocked state in place rather than moving it into a holding directory.",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
         destructive_pattern!(
             "rm-rf-general",
             r"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
-            "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
+            "rm -rf is destructive and requires review of the exact target, reason, and explicit authorization.",
             High,
             "rm -rf recursively removes files and directories without confirmation prompts. \
              The -f (force) flag suppresses all warnings, making accidental deletions \
@@ -5016,15 +4915,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Typos in paths can delete unintended directories\n\
              - Wildcards can expand to match more than expected\n\
              - No undo mechanism exists\n\n\
-             Safe alternatives:\n\
-             - rm -ri: Interactive mode, confirms each file. Needs a terminal: with stdin closed, as under an agent hook, it prompts, deletes nothing, and exits 0\n\
-             - mv <path> /tmp/delete-me-<literal-timestamp>: Move the tree aside instead of deleting it (dcg allows this form)\n\
-             - trash-cli (Linux) or mv <path> ~/.Trash/ (macOS): Moves files to trash instead of deleting\n\
-             - rm -rf in literal /tmp or /var/tmp subdirectories: Allowed\n\
-             - Variable-rooted paths such as $TMPDIR: Reviewed because the environment may point anywhere\n\n\
              Preview what would be deleted:\n  \
              find /path/to/delete -type f | wc -l  # Count files\n  \
-             ls -la /path/to/delete               # List contents",
+             ls -la /path/to/delete               # List contents\n\n\
+             Review unique work, active consumers, the removal reason, and explicit \
+             authorization for the exact target. Use only the scoped review mechanism \
+             actually offered by the denial. Otherwise retain state in place and report \
+             the blocked action; do not generate another archive or holding copy.",
             RM_RF_GENERAL_SUGGESTIONS
         ),
         // Globbed rm under a home directory, with or without -r/-f (#247).
@@ -5074,8 +4971,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safer approach for temporary directories:\n\
              - rm -r -f /tmp/mydir    # Allowed - temp directories are safe\n\
              - Resolve and inspect $TMPDIR before using it as a deletion root\n\n\
-             For other paths, prefer:\n  \
-             rm -ri /path  # Interactive confirmation",
+             For other paths, inspect with ls -la /path and review the exact target, \
+             reason, unique work, active consumers, and explicit authorization. Retain \
+             blocked state in place rather than moving it elsewhere.",
             RM_R_F_SEPARATE_SUGGESTIONS
         ),
         // rm --recursive --force (long flags)
@@ -5093,13 +4991,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              All standard rm -rf precautions apply:\n\
              - Verify the path before running\n\
              - Use absolute paths to avoid ambiguity\n\
-             - Consider using trash-cli for recoverable deletion\n\n\
+             - Preserve unique work and establish explicit authorization\n\n\
              Preview command:\n  \
              find /path -maxdepth 2 -ls | head -30\n\n\
-             Forms dcg accepts instead:\n  \
-             rm --recursive --force /tmp/<subdir>   # literal temp paths are allowed\n  \
-             rm -ri /path/to/directory              # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
-             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
+             Inspect the exact target with ls -la /path/to/directory. If removal \
+             remains blocked, retain it in place and report the reason. Do not create \
+             a holding copy or switch deletion paths to get around the guard.",
             RM_RECURSIVE_FORCE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
@@ -9723,7 +9620,7 @@ mod classifier_guidance_tests {
     /// Forms dcg accepts, either unconditionally or for literal temp paths.
     /// An explanation that names none of them tells the caller only that it
     /// lost.
-    const ACCEPTED_FORMS: &[&str] = &["rm -ri", "/tmp/delete-me-", "ls -la", "-WhatIf"];
+    const ACCEPTED_FORMS: &[&str] = &["rm -ri", "ls -la", "-WhatIf"];
 
     #[test]
     fn every_classifier_rule_resolves_to_authored_guidance() {
@@ -9808,20 +9705,39 @@ mod classifier_guidance_tests {
     }
 
     #[test]
-    fn rm_suggestions_no_longer_advertise_linux_trash_on_macos() {
-        // #348: `~/.local/share/Trash` does not exist on macOS; every rm rule
-        // that offers a trash move must offer the Finder trash for macOS.
+    fn recursive_rm_guidance_retains_blocked_state_without_duplicate_copies() {
         let pack = create_pack();
-        let trash_rules = [RM_RF_GENERAL_NAME, RM_RECURSIVE_GENERAL_NAME];
-        for name in trash_rules {
-            let (_, suggestions) = pack.rule_guidance(name);
-            assert!(
-                suggestions.iter().any(|suggestion| {
-                    suggestion.platform == Platform::MacOS
-                        && suggestion.command.contains("~/.Trash")
-                }),
-                "{name} offers no macOS trash suggestion"
-            );
+        for name in [
+            RM_RF_ROOT_HOME_NAME,
+            RM_R_F_SEPARATE_ROOT_HOME_NAME,
+            RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            RM_RF_GENERAL_NAME,
+            RM_R_F_SEPARATE_NAME,
+            RM_RECURSIVE_FORCE_NAME,
+            RM_RECURSIVE_GENERAL_NAME,
+        ] {
+            let (explanation, suggestions) = pack.rule_guidance(name);
+            let explanation = explanation.expect("recursive rule guidance");
+            assert!(explanation.contains("in place"), "{name}: {explanation}");
+            for forbidden in [
+                "mv /",
+                "delete-me-",
+                "trash-cli",
+                "~/.Trash",
+                "run it manually",
+            ] {
+                assert!(!explanation.contains(forbidden), "{name}: {explanation}");
+            }
+            assert!(!suggestions.is_empty(), "{name}");
+            for suggestion in suggestions {
+                assert!(
+                    suggestion.command.starts_with("ls ")
+                        || suggestion.command.starts_with("find "),
+                    "{name}: {}",
+                    suggestion.command
+                );
+            }
         }
     }
 

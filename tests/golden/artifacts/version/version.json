@@ -1,6 +1,6 @@
 {
   "exit_code": 0,
-  "stdout": "<package_version>\n",
+  "stdout": "<package_version>\nOperator patch: workflow-cleanup-1\n",
   "stderr_facts": {
     "title": "Destructive Command Guard",
     "binary_version": "dcg v<package_version>",

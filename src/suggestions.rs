@@ -770,12 +770,11 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         .with_command("find path -maxdepth 2 -print"),
         Suggestion::new(
             SuggestionKind::SaferAlternative,
-            "Copy one specific, explicitly reviewed file or directory to a backup; `reviewed-path` must be non-root, non-home, and non-sensitive, never the blocked root, home, or sensitive target, and the original is preserved",
-        )
-        .with_command("cp -a reviewed-path /tmp/reviewed-backup"),
+            "If a specific file or directory was intended, narrow the target and review it separately; retain the blocked root, home, or sensitive state in place",
+        ),
         Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Verify the backup first and require separate approval for any cleanup; never substitute the blocked root, home, or sensitive path itself",
+            "Establish explicit authorization for the exact reviewed action and use only a scoped mechanism offered by the denial; otherwise report the blocked action without creating another copy",
         ),
     ];
     for &rule_id in ROOT_HOME_RECURSIVE_RM_SUGGESTION_RULES {
@@ -790,12 +789,11 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         .with_command("find path -maxdepth 2 -print"),
         Suggestion::new(
             SuggestionKind::SaferAlternative,
-            "Use `rm -ri` only from an interactive terminal; with stdin closed (as under an agent hook), it deletes nothing and exits 0",
-        )
-        .with_command("rm -ri path"),
+            "Retain the target in place while reviewing unique work, active consumers, and the reason for removal",
+        ),
         Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Move to trash with `trash-put path` on Linux (trash-cli), or `mv path ~/.Trash/` on macOS",
+            "After explicit authorization for the exact action, use only the scoped review mechanism offered by the denial; otherwise report the blocked removal without moving or archiving its target",
         ),
     ];
     for &rule_id in GENERAL_RECURSIVE_RM_SUGGESTION_RULES {
@@ -2409,23 +2407,12 @@ mod tests {
             assert!(!preview.text.contains("path/"), "{rule_id}");
 
             let narrowed = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
-            assert_eq!(
-                narrowed.command.as_deref(),
-                Some("cp -a reviewed-path /tmp/reviewed-backup"),
-                "{rule_id}"
-            );
-            assert!(
-                narrowed
-                    .text
-                    .contains("specific, explicitly reviewed file or directory")
-            );
-            assert!(
-                narrowed
-                    .text
-                    .contains("must be non-root, non-home, and non-sensitive")
-            );
-            assert!(narrowed.text.contains("never the blocked root"));
-            assert!(narrowed.text.contains("original is preserved"));
+            assert!(narrowed.command.is_none(), "{rule_id}");
+            assert!(narrowed.text.contains("narrow the target"));
+            assert!(narrowed.text.contains("in place"));
+            let review = required_suggestion(rule_id, SuggestionKind::WorkflowFix);
+            assert!(review.text.contains("explicit authorization"));
+            assert!(review.text.contains("offered by the denial"));
 
             let commands = get_suggestions(rule_id)
                 .expect("root/home guidance")
@@ -2436,6 +2423,10 @@ mod tests {
             assert!(!commands.contains("rm -r"), "{rule_id}: {commands}");
             assert!(
                 !commands.contains("rm --recursive"),
+                "{rule_id}: {commands}"
+            );
+            assert!(
+                !commands.contains("cp ") && !commands.contains("mv "),
                 "{rule_id}: {commands}"
             );
         }
@@ -2452,19 +2443,14 @@ mod tests {
             );
             assert!(!preview.text.contains("path/"), "{rule_id}");
 
-            let interactive = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
-            assert_eq!(interactive.command.as_deref(), Some("rm -ri path"));
-            assert!(
-                interactive.text.contains("interactive terminal"),
-                "{rule_id}"
-            );
-            assert!(interactive.text.contains("stdin closed"), "{rule_id}");
-            assert!(interactive.text.contains("deletes nothing"), "{rule_id}");
-
-            let trash = required_suggestion(rule_id, SuggestionKind::WorkflowFix);
-            assert!(trash.text.contains("trash-put") && trash.text.contains("Linux"));
-            assert!(trash.text.contains("~/.Trash/") && trash.text.contains("macOS"));
-            assert!(!trash.text.contains("~/.local/share/Trash"), "{rule_id}");
+            let retained = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert!(retained.command.is_none(), "{rule_id}");
+            assert!(retained.text.contains("in place"), "{rule_id}");
+            assert!(retained.text.contains("unique work"), "{rule_id}");
+            let review = required_suggestion(rule_id, SuggestionKind::WorkflowFix);
+            assert!(review.command.is_none(), "{rule_id}");
+            assert!(review.text.contains("explicit authorization"));
+            assert!(review.text.contains("offered by the denial"));
         }
     }
 
@@ -2634,7 +2620,7 @@ mod tests {
             )
             .command
             .as_deref(),
-            Some("cp -a reviewed-path /tmp/reviewed-backup"),
+            None,
         );
 
         let unverified = get_suggestions("core.filesystem:rm-recursive-unverified")

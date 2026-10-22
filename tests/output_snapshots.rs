@@ -28,8 +28,8 @@ fn denial_box_plain_snapshot_covers_highlight_regex_and_alternatives() {
     .with_pattern_regex(r"^rm\s+-rf")
     .with_explanation("This recursively removes protected production data.")
     .with_alternatives(vec![
-        "mv /prod /tmp/prod.backup".to_string(),
-        "Ask the user to run the command manually".to_string(),
+        "ls -la /prod".to_string(),
+        "Retain blocked state in place and report the exact action".to_string(),
     ]);
 
     assert_snapshot!(

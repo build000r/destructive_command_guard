@@ -2880,12 +2880,8 @@ mod tests {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
                     permission_decision: "deny",
-                    permission_decision_reason: Cow::Owned(format!(
-                        "BLOCKED by dcg\n\n\
-                         Reason: {reason}\n\n\
-                         Command: {command}\n\n\
-                         If this operation is truly needed, ask the user for explicit \
-                         permission and have them run the command manually."
+                    permission_decision_reason: Cow::Owned(hook::format_denial_message(
+                        command, reason, None, None, None, None,
                     )),
                     allow_once_code: None,
                     allow_once_full_hash: None,

@@ -880,7 +880,7 @@ pub struct Remediation {
     /// Detailed explanation of why the command was blocked and what to do instead.
     pub explanation: String,
 
-    /// The command to run to allow this specific command once (e.g., "dcg allow-once abc12").
+    /// The command to run to allow this command once (e.g., "dcg allow-once abc12 --single-use").
     #[serde(rename = "allowOnceCommand")]
     pub allow_once_command: String,
 }
@@ -2850,9 +2850,9 @@ fn format_explanation_block(explanation: &str) -> String {
 /// scoped `dcg allow-once <code>` remedy (GH#332): harnesses commonly surface
 /// only `permissionDecisionReason` to the model and drop the sibling JSON
 /// fields, so a code that appears only in `allowOnceCode`/`remediation` is
-/// emitted but never read. The wording keeps the human in the loop: the user
-/// approves the single command, which is strictly safer than the fallback of
-/// having them run the destructive command by hand.
+/// emitted but never read. Explicit authorization still applies to the exact
+/// reviewed action; the denial does not send agents to an alternate deleter or
+/// create another holding directory.
 #[must_use]
 pub fn format_denial_message(
     command: &str,
@@ -2868,7 +2868,7 @@ pub fn format_denial_message(
     let trailer = pack
         .and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
         .unwrap_or(
-            "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+            "Retain the affected state in place and report this exact blocked action and reason. Do not move or archive it merely to get around this denial.",
         );
     let mut message = format_matched_message(
         "BLOCKED by dcg",
@@ -2883,7 +2883,7 @@ pub fn format_denial_message(
         use std::fmt::Write as _;
         let _ = write!(
             message,
-            "\n\nTo permit this single command once, the user can approve it with: dcg allow-once {code}"
+            "\n\nWhen explicit user authorization covers this exact reviewed action, including authorization already given, permit only this command once with: dcg allow-once {code} --single-use"
         );
     }
     message
@@ -3044,7 +3044,10 @@ pub(crate) fn print_colorful_warning_to(
             // Advertise the scoped single-command remedy ahead of the
             // persistent allowlist widening (GH#332).
             if let Some(code) = allow_once_code {
-                let _ = writeln!(writer, "  $ {cyan}dcg allow-once {code}{reset}");
+                let _ = writeln!(
+                    writer,
+                    "  $ {cyan}dcg allow-once {code} --single-use{reset}"
+                );
             }
 
             if let Some(ref rule) = rule_id {
@@ -3171,7 +3174,9 @@ fn get_contextual_suggestion(command: &str) -> Option<&'static str> {
     } else if command.contains("push") && command.contains("force") {
         Some("Consider using '--force-with-lease' for safer force pushing.")
     } else if command.contains("rm -rf") || command.contains("rm -r") {
-        Some("Verify the path carefully before running rm -rf manually.")
+        Some(
+            "Inspect the exact target and preserve unique work. Retain it in place while the reviewed removal remains blocked.",
+        )
     } else if command.contains("DROP") || command.contains("drop") {
         Some("Consider backing up the database/table before dropping.")
     } else if command.contains("kubectl") && command.contains("delete") {
@@ -3271,7 +3276,7 @@ pub fn write_denial_to(
         Remediation {
             safe_alternative: get_contextual_suggestion(command).map(String::from),
             explanation: explanation_text,
-            allow_once_command: format!("dcg allow-once {}", info.code),
+            allow_once_command: format!("dcg allow-once {} --single-use", info.code),
         }
     });
 
@@ -3514,7 +3519,7 @@ pub fn write_review_request_to(
             let remediation = allow_once.map(|info| Remediation {
                 safe_alternative: get_contextual_suggestion(command).map(String::from),
                 explanation: format_explanation_text(explanation, rule_id.as_deref(), pack),
-                allow_once_command: format!("dcg allow-once {}", info.code),
+                allow_once_command: format!("dcg allow-once {} --single-use", info.code),
             });
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
@@ -5904,11 +5909,15 @@ mod tests {
             message.contains("dcg allow-once 137527"),
             "reason must name the scoped remedy: {message}"
         );
-        // The scoped remedy stays human-in-the-loop.
+        // The scoped remedy requires explicit authorization and stays single-use.
         assert!(
-            message.contains("the user can approve it"),
-            "allow-once line must keep the user in the loop: {message}"
+            message.contains("explicit user authorization"),
+            "allow-once line must retain the authorization requirement: {message}"
         );
+        assert!(message.contains("including authorization already given"));
+        assert!(message.contains("dcg allow-once 137527 --single-use"));
+        assert!(!message.contains("run the command manually"));
+        assert!(!message.contains("mv "));
     }
 
     /// GH#332 planted negative: with no code minted, the reason must not
@@ -5928,6 +5937,8 @@ mod tests {
             !message.contains("allow-once"),
             "no code minted, so no allow-once mention: {message}"
         );
+        assert!(message.contains("Retain the affected state in place"));
+        assert!(!message.contains("run the command manually"));
     }
 
     /// A hook decision is replayed in the agent transcript on every later

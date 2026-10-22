@@ -54,9 +54,9 @@ fn mask_dynamic_fields(mut json: Value) -> Value {
 
         // Mask dynamic field in remediation
         if let Some(remediation) = hook_output.get_mut("remediation") {
-            if remediation.get("allowOnceCommand").is_some() {
+            if let Some(command) = remediation.get("allowOnceCommand").and_then(Value::as_str) {
                 remediation["allowOnceCommand"] =
-                    Value::String("dcg allow-once <DYNAMIC>".to_string());
+                    Value::String(mask_allow_once_code_in_text(command));
             }
         }
 
@@ -90,6 +90,17 @@ fn mask_allow_once_code_in_text(text: &str) -> String {
         return text.to_string();
     }
     format!("{}<DYNAMIC>{}", &text[..code_start], &text[code_end..])
+}
+
+#[test]
+fn golden_masks_only_remediation_code_and_preserves_single_use() {
+    let input = serde_json::json!({"hookSpecificOutput": {
+        "remediation": {"allowOnceCommand": "dcg allow-once 137527 --single-use"}
+    }});
+    assert_eq!(
+        mask_dynamic_fields(input)["hookSpecificOutput"]["remediation"]["allowOnceCommand"],
+        "dcg allow-once <DYNAMIC> --single-use"
+    );
 }
 
 /// Compare JSON output against a golden file.

@@ -6600,7 +6600,7 @@ destructive_patterns:
         let (_temp, output) = setup_custom_pack_env(pack_content, "git reset --hard");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("have them run the command manually"),
+            stdout.contains("Retain the affected state in place"),
             "{stdout}"
         );
     }
