@@ -2981,6 +2981,65 @@ fn static_git_subcommand_index(words: &[GitSemanticWord], mut index: usize) -> O
     None
 }
 
+/// Distinguish the literal `git log --cherry-pick` option from the mutating
+/// subcommand without relaxing the strict rule's fallback for unknown syntax.
+pub(crate) fn cherry_pick_text_is_log_option(command: &str, dialect: ShellDialect) -> bool {
+    if !command.contains("cherry-pick") {
+        return false;
+    }
+    // The unknown-shell decoder deliberately preserves ambiguous quoting and
+    // escapes. An exemption needs agreement from every concrete interpretation,
+    // otherwise an escaped second subcommand could disappear from this proof.
+    if dialect == ShellDialect::Unknown {
+        return [
+            ShellDialect::Posix,
+            ShellDialect::Cmd,
+            ShellDialect::PowerShell,
+        ]
+        .into_iter()
+        .all(|candidate| cherry_pick_text_is_log_option(command, candidate));
+    }
+    let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
+    let mut proved_log = false;
+    for segment in segments {
+        let semantic = git_semantic_command(segment, dialect);
+        let Some(decoded) = decode_git_semantic_words(&semantic, dialect) else {
+            return false;
+        };
+        if decoded.over_limit || decoded.words.iter().any(|word| word.dynamic) {
+            return false;
+        }
+        // Decode before looking for the text: `cherry\\-pick` and adjacent
+        // quoted fragments can still name the real mutating subcommand.
+        if !decoded
+            .words
+            .iter()
+            .any(|word| word.decoded.contains("cherry-pick"))
+        {
+            continue;
+        }
+        let Some(executable) = static_git_executable_index(&decoded.words, dialect) else {
+            return false;
+        };
+        let Some(subcommand) = static_git_subcommand_index(&decoded.words, executable + 1) else {
+            return false;
+        };
+        if decoded.words[subcommand].decoded != "log"
+            || decoded
+                .words
+                .iter()
+                .any(|word| word.decoded.contains("cherry-pick") && word.decoded != "--cherry-pick")
+            || !decoded.words[subcommand + 1..]
+                .iter()
+                .any(|word| word.decoded == "--cherry-pick")
+        {
+            return false;
+        }
+        proved_log = true;
+    }
+    proved_log
+}
+
 fn record_cross_segment_environment(
     words: &[GitSemanticWord],
     dialect: ShellDialect,

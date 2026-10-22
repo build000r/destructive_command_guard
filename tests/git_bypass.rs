@@ -33,6 +33,79 @@ fn run_hook(command: &str) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn strict_git_hook_decision(command: &str) -> String {
+    let temp = tempfile::tempdir().expect("temporary hook home");
+    let input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    });
+    let mut child = Command::new(dcg_binary())
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_NO_SELF_HEAL", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        .env("DCG_PACKS", "core.git,strict_git")
+        .current_dir(temp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn isolated strict Git hook");
+    serde_json::to_writer(child.stdin.take().expect("hook stdin"), &input)
+        .expect("write hook envelope");
+    let output = child.wait_with_output().expect("wait for hook");
+    assert!(
+        output.status.success(),
+        "hook failed for {command}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.stdout.is_empty() {
+        return "allow".to_string();
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid hook response");
+    value["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .expect("hook decision")
+        .to_string()
+}
+
+#[test]
+fn strict_git_log_cherry_pick_option_survives_native_hook() {
+    for command in [
+        "git log --oneline --left-right --cherry-pick main...11a317bf",
+        "git -C /repo --no-pager log --cherry-pick main...topic",
+        "git -c user.name=reviewer --git-dir=.git log --cherry-pick main...topic",
+        "git diff --stat && git log --cherry-pick main...topic && git show --stat HEAD",
+        "git diff --stat; git log --cherry-pick main...topic; git show --stat HEAD",
+    ] {
+        assert_eq!(strict_git_hook_decision(command), "allow", "{command}");
+    }
+}
+
+#[test]
+fn strict_git_log_refinement_cannot_hide_native_hook_denials() {
+    for command in [
+        "git cherry-pick abc123",
+        "git -C /repo cherry-pick abc123",
+        "git log --cherry-pick main...topic; git cherry-pick abc123",
+        "git cherry-pick abc123 && git log --cherry-pick main...topic",
+        "git log --cherry-pick main...topic && git reset --hard",
+        "git -c alias.history=log history --cherry-pick main...topic",
+        "git $OPTIONS log --cherry-pick main...topic",
+        "git log --cherry-pick \"$(git cherry-pick abc123)\"",
+        "sh -c 'git cherry-pick abc123; git log --cherry-pick main...topic'",
+        "git log --cherry-pick main...topic; git cherry\\-pick abc123",
+        "git log --cherry-pick main...topic; git 'cherry-'pick abc123",
+        "git -c core.pager='git cherry-pick abc123' log --cherry-pick main...topic",
+    ] {
+        assert_eq!(strict_git_hook_decision(command), "deny", "{command}");
+    }
+}
+
 #[test]
 fn git_global_flag_bypass() {
     // This command is destructive but currently bypassed because regex expects "git reset" directly

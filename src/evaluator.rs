@@ -21211,6 +21211,18 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            // Apply the same argv proof as the per-segment pass; otherwise
+            // this final whole-command fallback would restore the false hit.
+            if pack_id == "strict_git"
+                && pattern.name == Some("cherry-pick")
+                && crate::packs::core::git::cherry_pick_text_is_log_option(
+                    original_command,
+                    shell_dialect,
+                )
+            {
+                continue;
+            }
+
             // A package-manager `publish` regex matches on the sanitized view,
             // which has lost the quoting that separates `--reporter "publish"`
             // (a value) from the `publish` subcommand. Confirm against the
@@ -25970,6 +25982,19 @@ fn evaluate_pack_destructive_patterns(
         }
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+
+        // The strict substring rule also sees `git log --cherry-pick`.
+        // Withdraw only that finding when the real argv proves the log option;
+        // dynamic/nested commands retain the existing conservative fallback.
+        if pack_id == "strict_git"
+            && pattern.name == Some("cherry-pick")
+            && crate::packs::core::git::cherry_pick_text_is_log_option(
+                original_command,
+                shell_dialect,
+            )
+        {
+            continue;
         }
 
         // A package-manager `publish` regex matches on the sanitized view,

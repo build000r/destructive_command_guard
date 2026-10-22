@@ -299,6 +299,43 @@ mod tests {
     }
 
     #[test]
+    fn log_cherry_pick_option_is_not_the_mutating_subcommand() {
+        let pack = create_pack();
+        for command in [
+            "git log --oneline --left-right --cherry-pick main...11a317bf",
+            "git -C /repo log --cherry-pick main...topic",
+            "git --no-pager --git-dir=.git log --cherry-pick main...topic",
+            "git -c user.name=reviewer log --cherry-pick main...topic",
+            "git diff --stat && git log --cherry-pick main...topic && git show --stat HEAD",
+        ] {
+            assert_no_match(&pack, command);
+        }
+    }
+
+    #[test]
+    fn log_cherry_pick_refinement_preserves_mutating_and_ambiguous_denials() {
+        let pack = create_pack();
+        for command in [
+            "git cherry-pick abc123",
+            "git -C /repo cherry-pick abc123",
+            "git-cherry-pick abc123",
+            "git log --cherry-pick main...topic; git cherry-pick abc123",
+            "git cherry-pick abc123 && git log --cherry-pick main...topic",
+            "git $OPTIONS log --cherry-pick main...topic",
+            "git history --cherry-pick main...topic",
+            "git log --cherry-pick \"$(git cherry-pick abc123)\"",
+            "git log --cherry-pick main...topic; git cherry\\-pick abc123",
+            "git log --cherry-pick main...topic; git 'cherry-'pick abc123",
+            "git -c core.pager='git cherry-pick abc123' log --cherry-pick main...topic",
+            // The direct Pack API has no shell identity. Cmd treats semicolons
+            // as argument data, so this is not universally a proven log call.
+            "git diff --stat; git log --cherry-pick main...topic; git show --stat HEAD",
+        ] {
+            assert_blocks(&pack, command, "duplicate commits");
+        }
+    }
+
+    #[test]
     fn strict_git_patterns_match_with_git_global_flags() {
         // Same class bug as cloud/container packs: git's global flags
         // (`-C <path>`, `-c key=value`, `--git-dir=`, `--work-tree=`,

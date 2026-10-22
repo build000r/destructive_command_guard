@@ -864,6 +864,14 @@ impl Pack {
         }
         self.destructive_patterns
             .iter()
+            .filter(|pattern| {
+                !(self.id == "strict_git"
+                    && pattern.name == Some("cherry-pick")
+                    && crate::packs::core::git::cherry_pick_text_is_log_option(
+                        cmd,
+                        crate::normalize::ShellDialect::Unknown,
+                    ))
+            })
             .find(|p| p.matches_command(cmd))
             .map(|p| DestructiveMatch {
                 reason: p.reason,
