@@ -51,8 +51,9 @@ pub struct HookInput {
     #[serde(default, deserialize_with = "deserialize_string_tolerant")]
     pub transcript_path: Option<String>,
 
-    /// Gemini working directory.
-    #[serde(default, deserialize_with = "deserialize_string_tolerant")]
+    /// Harness-reported working directory. Malformed explicit values remain
+    /// invalid, rather than becoming an omitted field and borrowing process cwd.
+    #[serde(default, deserialize_with = "deserialize_cwd_tolerant")]
     pub cwd: Option<String>,
 
     /// Event timestamp: an RFC 3339 string from Gemini, a number (epoch
@@ -308,6 +309,16 @@ where
             _ => None,
         },
     )
+}
+
+fn deserialize_cwd_tolerant<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(path) => path,
+        _ => String::new(),
+    }))
 }
 
 /// `tool_input` degraded to `None` when it is not an object.

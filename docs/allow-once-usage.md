@@ -6,7 +6,7 @@ This guide explains how to use the allow-once feature to temporarily override dc
 
 ## Overview
 
-When dcg blocks a command, it prints a 6-digit numeric code that can be used to temporarily allow that exact command. This provides an escape hatch for false positives without permanently weakening your security policy.
+When dcg blocks a command and can record the denial, it prints a 6-digit numeric code that can be used to temporarily allow that exact command. If its pending store is busy or unavailable, its deadline expires, or the command directory is unknown, the denial remains effective and explains why no code was recorded.
 
 **Key properties:**
 - Exceptions are scoped to the exact command + directory (project root in git repos, cwd otherwise)
@@ -87,6 +87,22 @@ Exceptions are scoped based on whether the command was blocked inside a git repo
 - **cwd scope** (outside git repos): If blocked outside a git repository, the exception only applies in the exact directory where the command was blocked.
 
 The scope is automatically determined—you cannot override it. This ensures exceptions are appropriately scoped: broad enough to be useful within a project, but not so broad that they leak across unrelated directories.
+
+For hook requests, the validated absolute `cwd` in the hook payload is the base
+directory. A statically resolvable leading `cd` changes the binding. Policy
+matching, pending-code creation, and grant consumption use that same directory;
+an unrelated hook process directory cannot supply a grant. Invalid explicit
+directories and ambiguous directory changes neither mint nor consume grants.
+Only payloads that omit `cwd` use the hook process directory.
+
+The hook can use only information its host supplies. In Codex 0.163,
+`exec_command` forwards `command` to `PreToolUse`, but omits its executor
+`workdir`; the hook's reported `cwd` can therefore remain the session directory.
+Inspect the pending entry's `cwd` before approving it. Keep the exact command
+and observed hook directory when retrying; use an explicit command target such
+as `git -C /absolute/repository ...` when needed. Do not mint a replacement grant
+under an assumed executor directory or widen the grant. Correct forwarding of
+executor `workdir` belongs to the Codex hook producer, not a guessed DCG field.
 
 ### Exact Command Match
 

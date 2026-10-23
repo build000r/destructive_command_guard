@@ -12285,43 +12285,16 @@ fn remap_modeled_posix_invocation_result(
     }
 }
 
-fn resolve_project_path(
-    heredoc_settings: &crate::config::HeredocSettings,
-    project_path: Option<&Path>,
-) -> Option<PathBuf> {
-    // An explicit working directory is authoritative and must be honored
-    // regardless of heredoc configuration. This value scopes *all* path-aware
-    // allowlist matching (`match_rule_at_path`, `match_exact_command_at_path`,
-    // …), not just heredoc content allowlists. Gating it behind the presence of
-    // a heredoc `content_allowlist` (as this once did) meant `paths = [...]`
-    // entries silently applied globally whenever no heredoc project allowlist
-    // was configured — a real scope-escape (see #186).
-    if let Some(path) = project_path {
-        return Some(path.to_path_buf());
-    }
-
-    // No explicit path was threaded through. Only fall back to a `current_dir`
-    // syscall when a heredoc content allowlist actually needs one; otherwise
-    // preserve the historical `None` (path restrictions skipped) for callers
-    // that deliberately pass no working directory.
-    if heredoc_settings
-        .content_allowlist
-        .as_ref()
-        .is_none_or(|a| a.projects.is_empty())
-    {
-        return None;
-    }
-
-    std::env::current_dir().ok()
-}
-
 fn allow_once_match(
     command: &str,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    evaluation_cwd: Option<&Path>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
-    let cwd = std::env::current_dir().ok()?;
-    let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
-    match store.match_command(command, &cwd, Utc::now(), allow_once_audit) {
+    // The hook process can run in a different directory from the guarded
+    // command. An unknown command directory must not borrow its grants.
+    let cwd = evaluation_cwd.filter(|path| path.is_absolute() && path.is_dir())?;
+    let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(cwd)));
+    match store.match_command(command, cwd, Utc::now(), allow_once_audit) {
         Ok(Some(entry)) => Some(entry),
         _ => None,
     }
@@ -12331,10 +12304,11 @@ fn allow_once_match(
 fn allow_once_match_force_config(
     command: &str,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    evaluation_cwd: Option<&Path>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
-    let cwd = std::env::current_dir().ok()?;
-    let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
-    match store.match_command_force_config(command, &cwd, Utc::now(), allow_once_audit) {
+    let cwd = evaluation_cwd.filter(|path| path.is_absolute() && path.is_dir())?;
+    let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(cwd)));
+    match store.match_command_force_config(command, cwd, Utc::now(), allow_once_audit) {
         Ok(Some(entry)) => Some(entry),
         _ => None,
     }
@@ -12472,6 +12446,9 @@ pub fn evaluate_command_with_pack_order(
     allowlists: &LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
 ) -> EvaluationResult {
+    let cwd = std::env::current_dir().ok().and_then(|base| {
+        crate::rebase_recovery::resolve_effective_cwd(&base, command, ShellDialect::Unknown)
+    });
     evaluate_command_with_pack_order_at_path(
         command,
         enabled_keywords,
@@ -12480,7 +12457,7 @@ pub fn evaluate_command_with_pack_order(
         compiled_overrides,
         allowlists,
         heredoc_settings,
-        None,
+        cwd.as_deref(),
     )
 }
 
@@ -12572,6 +12549,9 @@ pub fn evaluate_command_with_pack_order_deadline(
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
     deadline: Option<&Deadline>,
 ) -> EvaluationResult {
+    let cwd = std::env::current_dir().ok().and_then(|base| {
+        crate::rebase_recovery::resolve_effective_cwd(&base, command, ShellDialect::Unknown)
+    });
     evaluate_command_with_pack_order_deadline_at_path(
         command,
         enabled_keywords,
@@ -12581,7 +12561,7 @@ pub fn evaluate_command_with_pack_order_deadline(
         allowlists,
         heredoc_settings,
         allow_once_audit,
-        None,
+        cwd.as_deref(),
         deadline,
     )
 }
@@ -13006,7 +12986,7 @@ fn evaluate_command_in_single_dialect_view(
     // allow/block override patterns overlap; only a force allow-once exception
     // may intentionally bypass an explicit config block.
     if let Some(reason) = compiled_overrides.check_block(command) {
-        if allow_once_match_force_config(command, allow_once_audit).is_some() {
+        if allow_once_match_force_config(command, allow_once_audit, project_path).is_some() {
             return EvaluationResult::allowed();
         }
         return EvaluationResult::denied_by_config(reason.to_string());
@@ -13090,9 +13070,6 @@ fn evaluate_command_in_single_dialect_view(
     let mut precomputed_sanitized = None;
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
-    let project_path = resolve_project_path(heredoc_settings, project_path);
-    let project_path = project_path.as_deref();
-
     let posix_executable_model = model_literal_posix_executable_assignments(command, shell_dialect);
 
     // Launcher and substitution evaluation recurses before the ordinary
@@ -13103,7 +13080,7 @@ fn evaluate_command_in_single_dialect_view(
     let checked_allow_once_before_nested = may_evaluate_nested_payload_before_allowlists(command)
         || !posix_executable_model.invocations.is_empty();
     if checked_allow_once_before_nested
-        && (allow_once_match(command, allow_once_audit).is_some()
+        && (allow_once_match(command, allow_once_audit, project_path).is_some()
             || outer_command_allowlisted_before_nested_evaluation(
                 command,
                 allowlists,
@@ -13662,7 +13639,9 @@ fn evaluate_command_in_single_dialect_view(
     // Nested envelopes were checked before recursion above; ordinary commands
     // stay here, past quick rejection, to avoid ~65µs of filesystem I/O on
     // every unrelated hook invocation.
-    if !checked_allow_once_before_nested && allow_once_match(command, allow_once_audit).is_some() {
+    if !checked_allow_once_before_nested
+        && allow_once_match(command, allow_once_audit, project_path).is_some()
+    {
         return EvaluationResult::allowed();
     }
 
@@ -26324,7 +26303,10 @@ where
     }
 
     // Step 1: Check allow-once overrides (may be superseded by config blocklist).
-    let allow_once = allow_once_match(command, None);
+    let evaluation_cwd = std::env::current_dir().ok().and_then(|base| {
+        crate::rebase_recovery::resolve_effective_cwd(&base, command, ShellDialect::Unknown)
+    });
+    let allow_once = allow_once_match(command, None, evaluation_cwd.as_deref());
 
     // Step 2: Check precompiled block overrides before allow overrides. Deny
     // wins on overlapping config overrides unless allow-once was granted with
@@ -26357,8 +26339,7 @@ where
     let heredoc_settings = config.heredoc_settings();
     let mut precomputed_sanitized = None;
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
-    let project_path = resolve_project_path(&heredoc_settings, None);
-    let project_path = project_path.as_deref();
+    let project_path = evaluation_cwd.as_deref();
     if heredoc_settings.enabled && check_triggers(command) == TriggerResult::Triggered {
         let sanitized = sanitize_for_pattern_matching(command);
         let sanitized_str = sanitized.as_ref();

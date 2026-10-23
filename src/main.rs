@@ -633,10 +633,6 @@ fn try_deny_unparseable_payload(
         compiled_overrides,
         allowlists: &allowlists,
         heredoc_settings,
-        cwd_path: cwd_path.as_deref(),
-        // Only the truncated prefix of an oversized payload is available
-        // here; its envelope fields were never parsed.
-        hook_cwd: None,
         // With the envelope unparsed the harness-reported cwd is unknown, and
         // the hook process's own cwd is not a substitute for it, so
         // directory-scoped allowlist entries fail closed here (#387).
@@ -981,6 +977,7 @@ struct ResolvedDenyFamily {
     result: destructive_command_guard::evaluator::EvaluationResult,
     mode: DecisionMode,
     eval_duration: Duration,
+    evaluation_cwd: Option<PathBuf>,
 }
 
 /// Outcome of resolving (evaluating, mode-resolving, and rebase-recovery
@@ -1063,18 +1060,12 @@ struct HookEvalContext<'a> {
     compiled_overrides: &'a CompiledOverrides,
     allowlists: &'a LayeredAllowlist,
     heredoc_settings: &'a HeredocSettings,
-    cwd_path: Option<&'a Path>,
-    /// Working directory reported by the harness in the hook payload (`cwd`),
-    /// when present. This is where the command will run, which can differ
-    /// from the hook process's own cwd; rebase-recovery resolution prefers
-    /// it (#331). Allow-once and history keep using `cwd_path`, the path the
-    /// matching CLI commands resolve from.
-    hook_cwd: Option<&'a Path>,
     /// Base directory for matching directory-scoped (`paths = [...]`)
-    /// allowlist entries: the directory the harness says the command runs in,
+    /// allowlist entries and allow-once grants: the directory reported by the harness,
     /// before any `cd` on the command line itself is applied (#387). `None`
     /// means dcg could not determine it, which makes every path-scoped grant
-    /// inapplicable — a grant that cannot be located does not apply.
+    /// inapplicable — a grant that cannot be located does not apply. This cannot
+    /// recover an executor workdir that the harness omitted from its payload.
     scope_base: Option<&'a Path>,
     working_dir: &'a str,
     deadline: &'a Deadline,
@@ -1155,10 +1146,7 @@ fn attempt_rebase_recovery(
         return RecoveryAttempt::NotApplicable;
     }
 
-    let recovery_base = ctx
-        .hook_cwd
-        .filter(|path| path.is_absolute() && path.is_dir())
-        .or(ctx.cwd_path);
+    let recovery_base = ctx.scope_base;
     let Some(recovery_cwd) = recovery_base.and_then(|base| {
         rebase_recovery::resolve_recovery_cwd(
             base,
@@ -1470,6 +1458,7 @@ fn resolve_hook_command(
             result,
             mode: DecisionMode::Deny,
             eval_duration,
+            evaluation_cwd: scope_cwd,
         }));
     };
     let pack = info.pack_id.as_deref();
@@ -1502,6 +1491,7 @@ fn resolve_hook_command(
         result,
         mode,
         eval_duration,
+        evaluation_cwd: scope_cwd,
     }))
 }
 
@@ -1554,6 +1544,7 @@ fn publish_decisive_response(
         result,
         mode,
         eval_duration,
+        evaluation_cwd,
     } = *resolved;
     let Some(ref info) = result.pattern_info else {
         // Unreachable by construction: resolve_hook_command only builds a
@@ -1585,7 +1576,7 @@ fn publish_decisive_response(
 
     match mode {
         DecisionMode::Deny | DecisionMode::Ask => {
-            let store_path = PendingExceptionStore::default_path(ctx.cwd_path);
+            let store_path = PendingExceptionStore::default_path(evaluation_cwd.as_deref());
             let store = PendingExceptionStore::new(store_path);
             let reason = match (pack, pattern) {
                 (Some(pack_id), Some(pattern_name)) => {
@@ -1601,8 +1592,11 @@ fn publish_decisive_response(
             // the deadline is exhausted. On contention/failure the denial is
             // emitted WITHOUT a code — the block always stands.
             let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
+            let mut no_code_reason = "the hook deadline was exhausted";
             let remaining = ctx.deadline.remaining().unwrap_or(Duration::ZERO);
-            if !remaining.is_zero() {
+            if let Some(evaluation_cwd) = evaluation_cwd.as_deref()
+                && !remaining.is_zero()
+            {
                 let budget = PersistBudget {
                     lock_wait: remaining.min(ALLOW_ONCE_LOCK_WAIT),
                     allow_maintenance: remaining > ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
@@ -1616,7 +1610,7 @@ fn publish_decisive_response(
                 };
                 match store.record_block_bounded(
                     &command,
-                    ctx.working_dir,
+                    &evaluation_cwd.to_string_lossy(),
                     &reason,
                     &ctx.config.logging.redaction,
                     false,
@@ -1634,17 +1628,28 @@ fn publish_decisive_response(
                         }
                     }
                     // Lock stayed contended: denial is emitted without a code.
-                    Ok(None) => {}
+                    Ok(None) => no_code_reason = "the pending store was busy",
                     // A store error (notably the MAX_PENDING_BYTES hard cap)
                     // used to be swallowed, so allow-once issuance could stop
                     // silently and permanently. The block still stands; say so.
                     Err(e) => {
+                        no_code_reason = "the pending store could not be written";
                         emit_stderr!(
                             "[dcg] Warning: could not record an allow-once code for this block ({e}); the block still stands."
                         );
                     }
                 }
+            } else if evaluation_cwd.is_none() {
+                no_code_reason = "the command working directory could not be established";
             }
+            let denial_reason = if allow_once_info.is_some() {
+                info.reason.clone()
+            } else {
+                format!(
+                    "{} No allow-once code was recorded because {no_code_reason}; the command remains blocked.",
+                    info.reason
+                )
+            };
 
             let branch_ctx = if ctx.config.git_awareness.should_show_branch_in_output() {
                 result.branch_context.as_ref()
@@ -1679,7 +1684,7 @@ fn publish_decisive_response(
                 hook::output_review_request_for_protocol(
                     ctx.hook_protocol,
                     &command,
-                    &info.reason,
+                    &denial_reason,
                     pack,
                     pattern,
                     explanation,
@@ -1694,7 +1699,7 @@ fn publish_decisive_response(
                 hook::output_denial_for_protocol(
                     ctx.hook_protocol,
                     &command,
-                    &info.reason,
+                    &denial_reason,
                     pack,
                     pattern,
                     explanation,
@@ -2228,9 +2233,11 @@ fn main() {
     // omit it, and JSON piped in by hand — is the process cwd the sole
     // available signal.
     let scope_base = match hook_cwd {
-        Some(path) => Some(path).filter(|path| path.is_absolute() && path.is_dir()),
-        None => cwd_path.as_deref(),
-    };
+        Some(path) if path.is_absolute() => path.canonicalize().ok(),
+        Some(_) => None,
+        None => cwd_path.clone(),
+    }
+    .filter(|path| path.is_dir());
     let decision_logger = destructive_command_guard::logging::DecisionLogger::new(&config.logging);
 
     let eval_context = HookEvalContext {
@@ -2241,9 +2248,7 @@ fn main() {
         compiled_overrides: &compiled_overrides,
         allowlists: &allowlists,
         heredoc_settings: &heredoc_settings,
-        cwd_path: cwd_path.as_deref(),
-        hook_cwd,
-        scope_base,
+        scope_base: scope_base.as_deref(),
         working_dir: &working_dir,
         deadline: &deadline,
         hook_protocol,

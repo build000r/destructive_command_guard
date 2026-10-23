@@ -114,29 +114,229 @@ impl TestEnv {
         if let Some(cwd) = payload_cwd {
             input["cwd"] = serde_json::Value::String(cwd.to_string_lossy().to_string());
         }
+        self.run_payload(&input, process_cwd)
+    }
 
+    fn command(&self, process_cwd: &Path) -> Command {
         let mut cmd = Command::new(dcg_binary());
         cmd.env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_CONFIG_HOME", &self.xdg_config)
             .env("DCG_SELF_HEAL_HOOK", "0")
-            .current_dir(process_cwd)
-            .stdin(Stdio::piped())
+            .env("DCG_HISTORY_ENABLED", "false")
+            .env("DCG_HOOK_TIMEOUT_MS", "30000")
+            .env("DCG_PENDING_EXCEPTIONS_PATH", self.pending_path())
+            .env("DCG_ALLOW_ONCE_PATH", self.home.join("allow-once.jsonl"))
+            .current_dir(process_cwd);
+        cmd
+    }
+
+    fn run_payload(&self, input: &serde_json::Value, process_cwd: &Path) -> std::process::Output {
+        let mut cmd = self.command(process_cwd);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().expect("spawn dcg");
         {
             let stdin = child.stdin.as_mut().expect("stdin");
-            serde_json::to_writer(stdin, &input).expect("write payload");
+            serde_json::to_writer(stdin, input).expect("write payload");
         }
         child.wait_with_output().expect("wait for dcg")
+    }
+
+    fn pending_path(&self) -> PathBuf {
+        self.home.join("pending.jsonl")
+    }
+
+    fn pending(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(self.pending_path())
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("pending record"))
+            .collect()
+    }
+
+    fn redeem(&self, record: &serde_json::Value) {
+        let output = self
+            .command(&self.elsewhere)
+            .args([
+                "allow-once",
+                record["short_code"].as_str().expect("short code"),
+                "--hash",
+                record["full_hash"].as_str().expect("full hash"),
+                "--single-use",
+                "--yes",
+                "--json",
+            ])
+            .output()
+            .expect("redeem native grant");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
 /// Allowed ⇒ the hook publishes no decision document.
 fn allowed(output: &std::process::Output) -> bool {
     String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
+#[test]
+fn allow_once_pending_and_consumption_follow_payload_cwd() {
+    let env = TestEnv::new();
+    let denied = env.run_hook(PROBE, Some(&env.scope_in), &env.elsewhere);
+    assert!(!allowed(&denied));
+    let record = env.pending().pop().expect("pending grant");
+    assert_eq!(record["cwd"], env.scope_in.to_string_lossy().as_ref());
+    env.redeem(&record);
+
+    assert!(
+        !allowed(&env.run_hook(PROBE, Some(&env.scope_out), &env.scope_in)),
+        "a process directory inside the grant cannot authorize another payload directory"
+    );
+    assert!(
+        allowed(&env.run_hook(PROBE, Some(&env.scope_in), &env.elsewhere)),
+        "the unrelated denied request must not consume the exact scoped grant"
+    );
+    assert!(
+        !allowed(&env.run_hook(PROBE, Some(&env.scope_in), &env.elsewhere)),
+        "the native grant remains single-use"
+    );
+}
+
+#[test]
+fn allow_once_uses_static_cd_and_exact_outer_command() {
+    for nested in [false, true] {
+        let env = TestEnv::new();
+        let command = if nested {
+            format!("bash -c '{PROBE}'")
+        } else {
+            format!("cd '{}' && {PROBE}", sh(&env.scope_in))
+        };
+        let base = if nested {
+            &env.scope_in
+        } else {
+            &env.scope_out
+        };
+        assert!(!allowed(&env.run_hook(
+            &command,
+            Some(base),
+            &env.elsewhere
+        )));
+        let record = env.pending().pop().expect("outer pending grant");
+        assert_eq!(record["cwd"], env.scope_in.to_string_lossy().as_ref());
+        env.redeem(&record);
+        assert!(
+            !allowed(&env.run_hook(PROBE, Some(&env.scope_in), &env.elsewhere)),
+            "an outer command grant does not authorize the inner command alone"
+        );
+        assert!(allowed(&env.run_hook(&command, Some(base), &env.elsewhere)));
+    }
+}
+
+#[test]
+fn invalid_explicit_cwd_neither_mints_nor_consumes_a_grant() {
+    let env = TestEnv::new();
+    assert!(!allowed(&env.run_hook(
+        PROBE,
+        Some(&env.scope_in),
+        &env.elsewhere
+    )));
+    env.redeem(&env.pending().pop().expect("pending grant"));
+    let regular_file = env.home.join("not-a-directory");
+    fs::write(&regular_file, "fixture").expect("fixture file");
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(42),
+        serde_json::json!({}),
+        serde_json::json!(""),
+        serde_json::json!("relative"),
+        serde_json::json!(env.home.join("missing")),
+        serde_json::json!(regular_file),
+    ] {
+        let before = env.pending().len();
+        let input = serde_json::json!({"turn_id":"scope-test", "tool_name":"Bash",
+            "tool_input":{"command":PROBE}, "cwd":invalid});
+        let out = env.run_payload(&input, &env.scope_in);
+        assert!(
+            !allowed(&out),
+            "invalid cwd cannot borrow process scope: {input}"
+        );
+        assert_eq!(
+            env.pending().len(),
+            before,
+            "invalid cwd must not mint a grant"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .contains("working directory could not be established")
+        );
+    }
+    assert!(
+        allowed(&env.run_hook(PROBE, Some(&env.scope_in), &env.elsewhere)),
+        "invalid requests must leave the existing grant unconsumed"
+    );
+}
+
+#[test]
+fn unknown_directory_changes_do_not_mint_grants() {
+    let env = TestEnv::new();
+    for command in [
+        format!("cd \"$DEST\" && {PROBE}"),
+        format!("bash -c 'cd / && {PROBE}'"),
+        format!("{PROBE}; cd /; {PROBE}"),
+    ] {
+        assert!(!allowed(&env.run_hook(
+            &command,
+            Some(&env.scope_in),
+            &env.scope_in
+        )));
+        assert!(env.pending().is_empty());
+    }
+}
+
+#[test]
+fn omitted_cwd_uses_process_directory_but_unforwarded_workdir_is_not_invented() {
+    let env = TestEnv::new();
+    assert!(!allowed(&env.run_hook(PROBE, None, &env.scope_in)));
+    let record = env.pending().pop().expect("omitted-cwd grant");
+    assert_eq!(record["cwd"], env.scope_in.to_string_lossy().as_ref());
+    env.redeem(&record);
+    assert!(allowed(&env.run_hook(PROBE, None, &env.scope_in)));
+
+    // Codex 0.163 serializes only command, not exec_command.workdir. An
+    // unsupported extra key cannot silently change the documented cwd binding.
+    let input = serde_json::json!({"turn_id":"scope-test", "tool_name":"Bash",
+        "tool_input":{"command":PROBE,"workdir":env.scope_out}, "cwd":env.scope_in});
+    assert!(!allowed(&env.run_payload(&input, &env.elsewhere)));
+    assert_eq!(
+        env.pending().pop().expect("hook-cwd grant")["cwd"],
+        env.scope_in.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn busy_pending_store_explains_missing_code_in_codex_stdout() {
+    use fs2::FileExt;
+    let env = TestEnv::new();
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(env.pending_path())
+        .expect("pending file");
+    holder.lock_exclusive().expect("hold pending lock");
+    let input = serde_json::json!({"turn_id":"scope-test", "tool_name":"Bash",
+        "tool_input":{"command":PROBE}, "cwd":env.scope_in});
+    let out = env.run_payload(&input, &env.elsewhere);
+    FileExt::unlock(&holder).expect("unlock pending file");
+    assert!(!allowed(&out));
+    assert!(env.pending().is_empty());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("pending store was busy"));
 }
 
 #[test]

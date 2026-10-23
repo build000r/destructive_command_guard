@@ -213,6 +213,15 @@ fn build_gemini_payload(command: &str) -> String {
     )
 }
 
+/// Grant fixtures need a real directory; raw protocol fixtures retain their
+/// exact bytes, including malformed or nonexistent cwd values.
+fn payload_at_cwd(payload: &str, cwd: &std::path::Path) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(payload).expect("valid fixture payload");
+    value["cwd"] = serde_json::json!(cwd.canonicalize().expect("fixture cwd"));
+    serde_json::to_string(&value).expect("serialize fixture payload")
+}
+
 // ---------------------------------------------------------------------------
 // Hermetic subprocess runner
 //
@@ -1101,7 +1110,9 @@ fn claude_deny_matrix_multiple_destructive_commands() {
     ];
 
     for (cmd, expected_pack_fragment) in commands {
-        let outcome = run_claude_hook(cmd);
+        let cwd = tempfile::tempdir().expect("fixture cwd");
+        let payload = payload_at_cwd(&build_claude_payload(cmd), cwd.path());
+        let outcome = run_hook_raw(payload.as_bytes(), &[]);
         assert_eq!(
             outcome.exit_code, 0,
             "Claude deny must exit 0 for '{cmd}'\n{outcome}"
@@ -1531,7 +1542,7 @@ fn claude_allow_once_round_trip() {
     let home_path = home.path().to_path_buf();
     let system_path = std::env::var("PATH").unwrap_or_default();
 
-    let deny_payload = build_claude_payload("git reset --hard HEAD~1");
+    let deny_payload = payload_at_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -1598,7 +1609,8 @@ fn claude_allow_once_round_trip() {
     );
 
     // Step 3: Retry the same command — should now be allowed
-    let retry_payload = build_claude_payload("git reset --hard HEAD~1");
+    let retry_payload =
+        payload_at_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -2264,7 +2276,7 @@ fn codex_deny_creates_pending_exception_with_code() {
     let home_path = home.path().to_path_buf();
     let system_path = std::env::var("PATH").unwrap_or_default();
 
-    let payload = build_codex_payload("git reset --hard HEAD~1");
+    let payload = payload_at_cwd(&build_codex_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -2315,7 +2327,7 @@ fn codex_allow_once_round_trip() {
     let system_path = std::env::var("PATH").unwrap_or_default();
 
     // Step 1: Codex deny — creates pending exception in hermetic HOME
-    let deny_payload = build_codex_payload("git reset --hard HEAD~1");
+    let deny_payload = payload_at_cwd(&build_codex_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -2382,7 +2394,7 @@ fn codex_allow_once_round_trip() {
     );
 
     // Step 3: Retry under Codex — must now be allowed (exit 0)
-    let retry_payload = build_codex_payload("git reset --hard HEAD~1");
+    let retry_payload = payload_at_cwd(&build_codex_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -3022,7 +3034,13 @@ fn redirected_home_receives_every_hook_write() {
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(build_claude_payload("git reset --hard HEAD~1").as_bytes())
+        .write_all(
+            payload_at_cwd(
+                &build_claude_payload("git reset --hard HEAD~1"),
+                home.path(),
+            )
+            .as_bytes(),
+        )
         .unwrap();
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
