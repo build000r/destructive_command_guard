@@ -676,6 +676,29 @@ pub fn exec_sink_reconstructed_commands(
         if detect_destructive_in_args(region).is_some() {
             continue;
         }
+        // A Python argv list keeps dynamic values in their original slots.
+        // Dropping `repo` from ['git', '-C', repo, 'rev-parse', ref] instead
+        // invents `git -C rev-parse`, hiding the visible built-in command.
+        if language == ScriptLanguage::Python
+            && haystack[..m.start()]
+                .strip_suffix("subprocess.")
+                .is_some_and(|prefix| {
+                    !prefix.ends_with(|c: char| c.is_alphanumeric() || matches!(c, '_' | '.'))
+                })
+            && let Some(executable) = python_git_argv_executable(region)
+        {
+            // Once argv[0] is known to be Git, incomplete reconstruction must
+            // not return to the lossy literal join. Preserve its uncertainty
+            // for the existing Git dispatch guard instead of dropping slots.
+            let command = python_git_argv_with_runtime_slots(region, executable)
+                .unwrap_or_else(|| format!("{} {RUNTIME_VALUE}", shell_words::quote(executable)));
+            out.push(ReconstructedCommand {
+                command,
+                start: m.start(),
+                end: m.end(),
+            });
+            continue;
+        }
         // Operands, for the same reason `detect_destructive_in_args` uses them:
         // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
         // command the call actually runs (#474).
@@ -690,6 +713,118 @@ pub fn exec_sink_reconstructed_commands(
         });
     }
     out
+}
+
+fn python_git_argv_executable(call_text: &str) -> Option<&str> {
+    let (_, arguments) = call_text.split_once('(')?;
+    let argv = arguments
+        .trim_start()
+        .strip_prefix('[')
+        .map(str::trim_start)?;
+    let quote = argv.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let (executable, rest) = argv[1..].split_once(quote)?;
+    if executable.contains(['\\', '\n', '\r']) || !rest.trim_start().starts_with([',', ']']) {
+        return None;
+    }
+    crate::packs::core::git::command_executes_git_in_dialect(
+        &shell_words::quote(executable),
+        crate::normalize::ShellDialect::Posix,
+    )
+    .then_some(executable)
+}
+
+/// Preserve argv positions only for a bounded, explicit Python Git list.
+/// Unknown values remain shell expansions for the existing Git dispatcher to
+/// judge: an unknown -C path cannot move the command, while an unknown command,
+/// configuration option or branch flag still requires conservative analysis.
+/// Unsupported syntax and execution overrides leave dispatch unresolved.
+fn python_git_argv_with_runtime_slots(call_text: &str, executable: &str) -> Option<String> {
+    if call_text.len() > 16_384 || !call_text.ends_with(')') {
+        return None;
+    }
+    let started = Instant::now();
+    let ast = AstGrep::new(call_text, SupportLang::Python);
+    let root = ast.root();
+    let mut stack = vec![root.clone()];
+    let mut count = 0;
+    while let Some(node) = stack.pop() {
+        count += 1;
+        if count > 2_048
+            || started.elapsed() > Duration::from_millis(2)
+            || node.is_error()
+            || node.is_missing()
+        {
+            return None;
+        }
+        stack.extend(node.children());
+    }
+    let mut statements = root.children().filter(ast_grep_core::Node::is_named);
+    let statement = statements.next()?;
+    if statements.next().is_some() || statement.kind() != "expression_statement" {
+        return None;
+    }
+    let call = statement.children().find(ast_grep_core::Node::is_named)?;
+    if call.kind() != "call" || call.range() != (0..call_text.len()) {
+        return None;
+    }
+    let function = call.field("function")?;
+    if !matches!(
+        function.text().as_ref(),
+        "run" | "call" | "check_call" | "check_output" | "Popen"
+    ) {
+        return None;
+    }
+    let arguments = call.field("arguments")?;
+    let mut args = arguments.children().filter(ast_grep_core::Node::is_named);
+    let argv = args.next()?;
+    if argv.kind() != "list" || !argv.text().ends_with(']') {
+        return None;
+    }
+    for argument in args {
+        if argument.kind() != "keyword_argument" {
+            return None;
+        }
+        let name = argument.field("name")?;
+        match name.text().as_ref() {
+            "capture_output" | "text" | "check" | "cwd" | "stdout" | "stderr" | "stdin"
+            | "timeout" | "encoding" | "errors" => {}
+            "shell" if argument.field("value")?.kind() == "false" => {}
+            _ => return None,
+        }
+    }
+    let mut words = Vec::new();
+    for word in argv.children().filter(ast_grep_core::Node::is_named) {
+        if word.kind() == "string" {
+            let text = word.text();
+            let bytes = text.as_bytes();
+            if bytes.len() < 2 || !matches!(bytes[0], b'\'' | b'"') || bytes.last() != bytes.first()
+            {
+                return None;
+            }
+            let value = &text[1..text.len() - 1];
+            if value.contains(['\\', '\n', '\r', '\'', '"']) {
+                return None;
+            }
+            if words.is_empty() && value != executable {
+                return None;
+            }
+            words.push(shell_words::quote(value).into_owned());
+        } else {
+            if words.is_empty()
+                || !matches!(
+                    word.kind().as_ref(),
+                    "identifier" | "attribute" | "call" | "subscript" | "binary_operator"
+                )
+            {
+                return None;
+            }
+            words.push(RUNTIME_VALUE.to_string());
+        }
+    }
+    Some(words.join(" "))
 }
 
 /// High-signal filesystem sink fallback for cases where the full AST pass is

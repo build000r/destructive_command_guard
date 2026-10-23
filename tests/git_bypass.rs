@@ -107,6 +107,67 @@ fn strict_git_log_refinement_cannot_hide_native_hook_denials() {
 }
 
 #[test]
+fn python_git_readonly_argv_keeps_dynamic_argument_positions() {
+    for source in [
+        "subprocess.run(['git','-C',r,'rev-parse','--verify',ref+'^{commit}'], capture_output=True, text=True)",
+        "subprocess.run(['git','-C',r,'merge-base','--is-ancestor',oid,'HEAD'])",
+        "subprocess.check_output(['git','-C',str(keeper),'ls-files','*.py'])",
+        "subprocess.run(['git','-C',str(repo),'worktree','list','--porcelain'])",
+        "subprocess.run(['git','-C',r,'rev-parse','HEAD'], shell=False)",
+        "subprocess.run(['/usr/bin/git','-C',r,'rev-parse','HEAD'])",
+        "subprocess.check_output(['/opt/homebrew/bin/git','-C',str(repo),'ls-files'])",
+    ] {
+        for receiver in ["python3 -", "ssh build-host 'python3 -'"] {
+            let command = format!("{receiver} <<'PY'\nimport subprocess\n{source}\nPY");
+            assert_eq!(strict_git_hook_decision(&command), "allow", "{command}");
+        }
+    }
+}
+
+#[test]
+fn python_git_argv_positions_do_not_hide_destructive_dispatch() {
+    for source in [
+        "subprocess.run(['git','-C',r,'branch','-D',branch])",
+        "subprocess.run(['git','-C',r,'branch',flag,branch])",
+        "subprocess.run(['git','-C',r,'reset','--hard'])",
+        "subprocess.run(['git','-C',r,verb,'--hard'])",
+        "subprocess.run(['git','-C',r,'unknown-alias'])",
+        "subprocess.run(['git','-c',alias,'-C',r,'status'])",
+        "subprocess.run(['git','--exec-path='+helper,'-C',r,'status'])",
+        "subprocess.run(['git','--config-env',config,'-C',r,'status'])",
+        "subprocess.run(['git','-C',r,'rev-parse',ref+'^{commit}'], shell=True)",
+        "subprocess.run(['git','-C',r,'rev-parse',ref+'^{commit}'], executable=program)",
+        "subprocess.run(['git','-C',r,*args,'reset','--hard'])",
+        "subprocess.run([['git','-C',r,'rev-parse'][0],'reset','--hard'])",
+        "subprocess.run(['git','-C',r,'rev-parse',ref+'^{commit}'], **options)",
+        "run(['git','-C',r,'rev-parse',ref+'^{commit}'])",
+        "subprocess.run(['/usr/bin/git','-C',r,'branch',flag,branch])",
+        "subprocess.run(['/opt/homebrew/bin/git','-C',r,verb,'--hard'])",
+    ] {
+        for receiver in ["python3 -", "ssh build-host 'python3 -'"] {
+            let command = format!("{receiver} <<'PY'\nimport subprocess\n{source}\nPY");
+            assert_eq!(strict_git_hook_decision(&command), "deny", "{command}");
+        }
+    }
+}
+
+#[test]
+fn python_git_argv_bounds_do_not_restore_lossy_reconstruction() {
+    let oversized = format!(
+        "subprocess.run(['git','-C',r,'branch',flag,'{}'])",
+        "x".repeat(16_384)
+    );
+    let too_many_nodes = format!(
+        "subprocess.run(['git','-C',r,'branch',flag,{}'last'])",
+        "'x',".repeat(600)
+    );
+    for source in [oversized, too_many_nodes] {
+        let command = format!("python3 - <<'PY'\nimport subprocess\n{source}\nPY");
+        assert_eq!(strict_git_hook_decision(&command), "deny", "{command}");
+    }
+}
+
+#[test]
 fn git_global_flag_bypass() {
     // This command is destructive but currently bypassed because regex expects "git reset" directly
     let cmd = "git -C /tmp reset --hard";
