@@ -111,6 +111,7 @@ fn python_git_readonly_argv_keeps_dynamic_argument_positions() {
     for source in [
         "subprocess.run(['git','-C',r,'rev-parse','--verify',ref+'^{commit}'], capture_output=True, text=True)",
         "subprocess.run(['git','-C',r,'merge-base','--is-ancestor',oid,'HEAD'])",
+        "for prefix in ['90a89fb3', '8e321925', '31224b0a', '339296a3', '2d5002e3', '552eacb9', 'edc39088', '710401f9']:\n    subprocess.run(['git','-C',repo,'diff','--stat',prefix+'^1',prefix],check=True)",
         "subprocess.check_output(['git','-C',str(keeper),'ls-files','*.py'])",
         "subprocess.run(['git','-C',str(repo),'worktree','list','--porcelain'])",
         "subprocess.run(['git','-C',r,'rev-parse','HEAD'], shell=False)",
