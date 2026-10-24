@@ -11387,7 +11387,31 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         // An eval that is real stays visible either way: outside any heredoc it is
         // untouched, and inside a body a pipeline hands to a shell the pipeline
         // collector recursively evaluates that body, where the eval is seen again.
-        let eval_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+        // Quoted stdin owned by a proven non-shell interpreter is not POSIX
+        // source either: Perl's `eval <<'CODE'` must reach the Perl analyzer,
+        // not become a shell eval of `<<CODE`. This is an ownership boundary,
+        // not a safety exemption; all other collectors still get the original.
+        let foreign_bodies = crate::heredoc::quoted_non_shell_heredoc_ranges(
+            command,
+            crate::heredoc::ExtractionLimits::structural_scan().max_heredocs,
+        );
+        let foreign_view = if foreign_bodies.is_empty() {
+            Cow::Borrowed(command)
+        } else {
+            let masked = (|| {
+                let mut bytes = command.as_bytes().to_vec();
+                for body in foreign_bodies {
+                    for byte in bytes.get_mut(body)? {
+                        if !matches!(*byte, b'\n' | b'\r') {
+                            *byte = b' ';
+                        }
+                    }
+                }
+                String::from_utf8(bytes).ok()
+            })();
+            masked.map_or(Cow::Borrowed(command), Cow::Owned)
+        };
+        let eval_view = crate::heredoc::mask_non_expanding_data_heredocs(foreign_view.as_ref());
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         collect_posix_pipeline_executable_sinks(command, &mut sinks);
         collect_posix_process_substitution_sinks(command, &mut sinks);

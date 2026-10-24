@@ -240,10 +240,10 @@ These patterns match potentially destructive commands:
 | `ln-symlink-sensitive-then-delete` | symlink from a sensitive path into temp followed by forced recursive deletion can traverse and destroy the target. EXTREMELY DANGEROUS. | critical |
 | `rsync-sensitive-then-delete` | rsync archive of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS. | critical |
 | `rsync-delete-sensitive-dest` | rsync --delete into a system directory or home root mirror-deletes its contents. EXTREMELY DANGEROUS. | critical |
-| `rm-rf-root-home` | rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed. | critical |
+| `rm-rf-root-home` | rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed without review of the exact target and authorization. | critical |
 | `rm-r-f-separate-root-home` | rm with separate -r -f flags targeting root or home is EXTREMELY DANGEROUS. | critical |
 | `rm-recursive-force-root-home` | rm --recursive --force targeting root or home is EXTREMELY DANGEROUS. | critical |
-| `rm-rf-general` | rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually. | high |
+| `rm-rf-general` | rm -rf is destructive and requires review of the exact target, reason, and explicit authorization. | high |
 | `rm-glob-home` | rm with an unexpanded glob under a home directory deletes an unbounded, shell-chosen file set and requires human approval. | high |
 | `rm-r-f-separate` | rm with separate -r -f flags is destructive and requires human approval. | high |
 | `rm-recursive-force-long` | rm --recursive --force is destructive and requires human approval. | high |

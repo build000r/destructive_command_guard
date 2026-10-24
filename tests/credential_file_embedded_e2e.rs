@@ -64,7 +64,7 @@ fn response(command: &str, home: &Path) -> String {
     String::from_utf8(output.stdout).expect("UTF-8 hook output")
 }
 
-fn assert_cli(command: &str, home: &Path, rule: Option<&str>) {
+fn assert_cli(command: &str, home: &Path, rule: Option<(&str, &str)>) {
     let output = dcg(home)
         .args(["test", "--format", "json", command])
         .output()
@@ -83,13 +83,13 @@ fn assert_cli(command: &str, home: &Path, rule: Option<&str>) {
         if rule.is_some() { "deny" } else { "allow" },
         "{command}: {stdout}"
     );
-    if let Some(rule) = rule {
-        assert_eq!(json["pack_id"], "core.filesystem", "{command}: {stdout}");
+    if let Some((pack, rule)) = rule {
+        assert_eq!(json["pack_id"], pack, "{command}: {stdout}");
         assert_eq!(json["pattern_name"], rule, "{command}: {stdout}");
     }
 }
 
-fn assert_denied_by(command: &str, home: &Path, rule: &str) {
+fn assert_denied_in_pack(command: &str, home: &Path, pack: &str, rule: &str) {
     let output = response(command, home);
     let json: serde_json::Value = serde_json::from_str(&output)
         .unwrap_or_else(|error| panic!("{command}: {error}; output={output}"));
@@ -98,7 +98,11 @@ fn assert_denied_by(command: &str, home: &Path, rule: &str) {
         "{command}: {output}"
     );
     assert!(output.contains(rule), "wrong rule for {command}: {output}");
-    assert_cli(command, home, Some(rule));
+    assert_cli(command, home, Some((pack, rule)));
+}
+
+fn assert_denied_by(command: &str, home: &Path, rule: &str) {
+    assert_denied_in_pack(command, home, "core.filesystem", rule);
 }
 
 fn assert_denied(command: &str, home: &Path) {
@@ -164,6 +168,8 @@ fn php_perl_issue_466_benign_controls_reach_real_entry_points() {
 fn perl_fallback_preserves_data_and_rejects_later_truncation() {
     let home = home();
     for command in [
+        "perl <<'PERL'\neval <<'CODE';\nprint 42;\nCODE\nPERL",
+        "perl <<'PERL'\nprint eval <<'CODE';\nprint 42;\nCODE\nPERL",
         "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA\nPERL",
         "perl -e 'truncate(\"/tmp/out.txt\", 0);'",
         "perl -e 'open(FH, \"<\", \"/etc/shadow\"); truncate(FH, 0);'",
@@ -179,6 +185,31 @@ fn perl_fallback_preserves_data_and_rejects_later_truncation() {
         "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/tmp/out.txt');\nDATA\nopen(FH, '>', '/etc/shadow');\nPERL",
     ] {
         assert_denied(command, home.path());
+    }
+}
+
+#[test]
+fn foreign_eval_ownership_preserves_shell_execution_boundaries() {
+    let home = home();
+    for command in [
+        "eval 'git reset --hard'; perl <<'PERL'\nprint 42;\nPERL",
+        "perl <<'PERL'\nprint 42;\nPERL\neval 'git reset --hard'",
+        "perl <<'PERL'\nprint 42;\nPERL\ngit reset --hard",
+        "sh <<'SH'\neval 'git reset --hard'\nSH",
+        "perl <<PERL\nprint q($(git reset --hard));\nPERL",
+        "perl \"$(git reset --hard)\" <<'PERL'\nprint 42;\nPERL",
+        "cat <<'SH' | sh\neval 'git reset --hard'\nSH",
+    ] {
+        assert_denied_in_pack(command, home.path(), "core.git", "reset-hard");
+    }
+    // Incomplete process-substitution producers and foreign-interpreter output
+    // remain unverified shell input. Masking Perl's eval must not hide either.
+    for command in [
+        "cat <<'SH' > >(sh)\neval 'git reset --hard'\nSH",
+        "perl <<'PERL' | sh\neval <<'CODE';\nprint 42;\nCODE\nPERL",
+        "perl <<'PERL' > >(sh)\neval <<'CODE';\nprint 42;\nCODE\nPERL",
+    ] {
+        assert_denied_in_pack(command, home.path(), "heredoc.posix", "pipeline-consumer");
     }
 }
 

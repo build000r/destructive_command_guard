@@ -218,12 +218,28 @@ fn harness_reported_cwd_wins_over_the_hook_process_cwd() {
         "process cwd=rebasing, json cwd=clean",
     );
 
-    // An unusable `cwd` field (relative / nonexistent) falls back to the
-    // process cwd rather than disabling recovery.
-    let out = lab.hook(&lab.rebasing(), Some(Path::new("not/absolute")), RESTORE);
-    assert_allowed_by_recovery(&out, "relative json cwd falls back to process cwd");
-    let out = lab.hook(&lab.rebasing(), Some(&lab.root.join("missing")), RESTORE);
-    assert_allowed_by_recovery(&out, "missing json cwd falls back to process cwd");
+    // An explicit unusable `cwd` cannot borrow the process cwd to unlock
+    // recovery (the shared evaluation-directory contract from #387).
+    for (cwd, context) in [
+        (PathBuf::from("not/absolute"), "relative json cwd"),
+        (lab.root.join("missing"), "missing json cwd"),
+    ] {
+        let out = lab.hook(&lab.rebasing(), Some(&cwd), RESTORE);
+        assert_denied(&out, "restore-worktree", context);
+        let payload: serde_json::Value =
+            serde_json::from_str(&out.0).expect("structured hook denial");
+        let reason = payload["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("hook denial reason");
+        assert!(
+            reason.contains("the command working directory could not be established"),
+            "{context}: expected unknown-directory refusal, got: {reason}"
+        );
+    }
+
+    // Only an omitted `cwd` uses the process directory for recovery.
+    let out = lab.hook(&lab.rebasing(), None, RESTORE);
+    assert_allowed_by_recovery(&out, "omitted json cwd uses process cwd");
 }
 
 #[test]

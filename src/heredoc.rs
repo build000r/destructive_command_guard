@@ -8453,7 +8453,7 @@ pub(crate) fn structural_heredoc_body_ranges(
     }
     let heredocs = active_heredocs(command)
         .ok_or("Heredoc boundary analysis incomplete or unsupported; command requires review")?;
-    if heredocs.len() > ExtractionLimits::default().max_heredocs {
+    if heredocs.len() > ExtractionLimits::structural_scan().max_heredocs {
         return Err("Heredoc boundary count exceeds analysis limit; command requires review");
     }
     let mut ranges: Vec<_> = heredocs
