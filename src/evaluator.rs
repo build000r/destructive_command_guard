@@ -11902,7 +11902,15 @@ fn mask_checked_posix_substitutions<'a>(
     let Ok(shadow) = String::from_utf8(shadow) else {
         return Cow::Borrowed(sanitized);
     };
-    let shadow_sanitized = sanitize_for_pattern_matching(&shadow);
+    // This second sanitizer pass must preserve the same body boundaries as
+    // the primary view. Otherwise quotes inside an interpreter heredoc can
+    // turn a real trailing command into spaces, which the union below would
+    // incorrectly copy over the already-correct primary sanitization.
+    let Ok(shadow_sanitized) = sanitize_around_heredoc_bodies(&shadow) else {
+        // The shadow is only an optional data-mask proof. If replacing a
+        // substitution obscured its structure, add no new exemptions.
+        return Cow::Borrowed(sanitized);
+    };
     if shadow_sanitized.len() != sanitized.len() {
         return Cow::Borrowed(sanitized);
     }
@@ -13067,7 +13075,16 @@ fn evaluate_command_in_single_dialect_view(
     }
 
     // Step 3: Heredoc / inline-script detection (Tier 1/2/3, bounded fallback).
-    let mut precomputed_sanitized = None;
+    let mut precomputed_sanitized = if command.contains("<<")
+        && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+    {
+        match sanitize_around_heredoc_bodies(command) {
+            Ok(sanitized) => Some(sanitized),
+            Err(reason) => return EvaluationResult::denied_by_legacy(reason),
+        }
+    } else {
+        None
+    };
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
     let posix_executable_model = model_literal_posix_executable_assignments(command, shell_dialect);
@@ -13399,7 +13416,9 @@ fn evaluate_command_in_single_dialect_view(
         }
 
         if check_triggers(command) == TriggerResult::Triggered {
-            let sanitized = sanitize_for_pattern_matching(command);
+            let sanitized = precomputed_sanitized
+                .take()
+                .unwrap_or_else(|| sanitize_for_pattern_matching(command));
             let sanitized_str = sanitized.as_ref();
             let should_scan = if matches!(sanitized, std::borrow::Cow::Owned(_)) {
                 check_triggers(sanitized_str) == TriggerResult::Triggered
@@ -13552,7 +13571,10 @@ fn evaluate_command_in_single_dialect_view(
     let sanitized = if shell_dialect == ShellDialect::Cmd {
         Cow::Borrowed(command)
     } else if !matches!(report_data, Cow::Borrowed(_)) {
-        sanitize_for_pattern_matching(report_data.as_ref())
+        match sanitize_around_heredoc_bodies(report_data.as_ref()) {
+            Ok(sanitized) => sanitized,
+            Err(reason) => return EvaluationResult::denied_by_legacy(reason),
+        }
     } else {
         precomputed_sanitized.unwrap_or_else(|| sanitize_for_pattern_matching(command))
     };
@@ -13758,6 +13780,29 @@ fn evaluate_command_in_single_dialect_view(
     }
 
     result
+}
+
+/// Keep body quote/comment state out of outer-shell data sanitization.
+/// Structural boundaries prove neither inertness nor safety. Each body keeps
+/// the existing sanitizer treatment in isolation; the original command remains
+/// available unchanged to receiver, substitution and interpreter analysis.
+/// In particular, a Python triple-quoted string must not consume a command
+/// after its heredoc terminator as an inert shell argument.
+fn sanitize_around_heredoc_bodies(command: &str) -> Result<Cow<'_, str>, &'static str> {
+    let ranges = crate::heredoc::structural_heredoc_body_ranges(command)?;
+    if ranges.is_empty() {
+        return Ok(sanitize_for_pattern_matching(command));
+    }
+
+    let mut sanitized = String::with_capacity(command.len());
+    let mut start = 0;
+    for range in ranges {
+        sanitized.push_str(sanitize_for_pattern_matching(&command[start..range.start]).as_ref());
+        sanitized.push_str(sanitize_for_pattern_matching(&command[range.clone()]).as_ref());
+        start = range.end;
+    }
+    sanitized.push_str(sanitize_for_pattern_matching(&command[start..]).as_ref());
+    Ok(Cow::Owned(sanitized))
 }
 
 /// Shell reserved words that may precede the command word inside a compound
@@ -20465,7 +20510,8 @@ fn evaluate_packs_with_allowlists_at_depth(
     // and escape syntax, but they must not reinterpret literal stdin data as
     // executable source. Keep the dialect-preserving view and mask only
     // heredocs whose targets are proven not to execute their input.
-    let dialect_semantic_masked = crate::heredoc::mask_non_executing_heredocs(command_for_match);
+    let dialect_semantic_masked =
+        crate::heredoc::mask_non_executing_heredocs_preserving_offsets(command_for_match);
     let scp_semantic_masked = crate::heredoc::mask_non_executing_heredocs(original_command);
     let scp_command = if shell_dialect == crate::normalize::ShellDialect::Unknown {
         command_for_packs
@@ -20483,8 +20529,14 @@ fn evaluate_packs_with_allowlists_at_depth(
     } else {
         dialect_semantic_masked.as_ref()
     };
-    let core_git_segment_ranges =
-        command_segment_ranges_in_dialect(core_git_command, shell_dialect);
+    let core_git_segment_ranges = match semantic_segments_around_heredoc_bodies(
+        core_git_command,
+        original_command,
+        shell_dialect,
+    ) {
+        Ok(ranges) => ranges,
+        Err(reason) => return EvaluationResult::denied_by_legacy(reason),
+    };
     let core_git_offset = if shell_dialect == crate::normalize::ShellDialect::Unknown {
         normalized_offset
     } else {
@@ -20495,8 +20547,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     } else {
         dialect_semantic_masked.as_ref()
     };
-    let core_filesystem_segment_ranges =
-        command_segment_ranges_in_dialect(core_filesystem_command, shell_dialect);
+    let core_filesystem_segment_ranges = core_git_segment_ranges.clone();
     let core_filesystem_offset = if shell_dialect == crate::normalize::ShellDialect::Unknown {
         normalized_offset
     } else {
@@ -20510,8 +20561,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     } else {
         dialect_semantic_masked.as_ref()
     };
-    let cloudflare_workers_segment_ranges =
-        command_segment_ranges_in_dialect(cloudflare_workers_command, shell_dialect);
+    let cloudflare_workers_segment_ranges = core_git_segment_ranges.clone();
     let cloudflare_workers_offset = if shell_dialect == crate::normalize::ShellDialect::Unknown {
         normalized_offset
     } else {
@@ -21560,6 +21610,50 @@ fn command_segment_ranges(cmd: &str) -> Vec<(usize, usize)> {
             (start, start + segment.len())
         })
         .collect()
+}
+
+/// Add outer-shell segments without letting interpreter-body quotes consume
+/// their boundaries. Keep the original full-view ranges and receiver analysis:
+/// structural body ownership is not an exemption for any body content.
+fn semantic_segments_around_heredoc_bodies(
+    command: &str,
+    original: &str,
+    dialect: ShellDialect,
+) -> Result<Vec<(usize, usize)>, &'static str> {
+    let mut ranges = command_segment_ranges_in_dialect(command, dialect);
+    if dialect != ShellDialect::Posix || !original.contains("<<") {
+        return Ok(ranges);
+    }
+    let bodies = crate::heredoc::structural_heredoc_body_ranges(original)?;
+    if bodies.is_empty() {
+        return Ok(ranges);
+    }
+    if command.len() != original.len() {
+        return Err("Heredoc semantic view lost source offsets; command requires review");
+    }
+    let mut start = 0;
+    for body in bodies {
+        let Some(outer) = command.get(start..body.start) else {
+            return Err("Heredoc semantic boundaries are invalid; command requires review");
+        };
+        ranges.extend(
+            command_segment_ranges_in_dialect(outer, dialect)
+                .into_iter()
+                .map(|(a, b)| (start + a, start + b)),
+        );
+        start = body.end;
+    }
+    let Some(outer) = command.get(start..) else {
+        return Err("Heredoc semantic tail boundary is invalid; command requires review");
+    };
+    ranges.extend(
+        command_segment_ranges_in_dialect(outer, dialect)
+            .into_iter()
+            .map(|(a, b)| (start + a, start + b)),
+    );
+    ranges.sort_unstable();
+    ranges.dedup();
+    Ok(ranges)
 }
 
 fn command_segment_ranges_in_dialect(
@@ -26337,11 +26431,20 @@ where
     // Step 3: Heredoc / inline-script detection (Tier 1/2/3, bounded fallback).
     // See `evaluate_command` for detailed rationale.
     let heredoc_settings = config.heredoc_settings();
-    let mut precomputed_sanitized = None;
+    let mut precomputed_sanitized = if command.contains("<<") {
+        match sanitize_around_heredoc_bodies(command) {
+            Ok(sanitized) => Some(sanitized),
+            Err(reason) => return EvaluationResult::denied_by_legacy(reason),
+        }
+    } else {
+        None
+    };
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
     let project_path = evaluation_cwd.as_deref();
     if heredoc_settings.enabled && check_triggers(command) == TriggerResult::Triggered {
-        let sanitized = sanitize_for_pattern_matching(command);
+        let sanitized = precomputed_sanitized
+            .take()
+            .unwrap_or_else(|| sanitize_for_pattern_matching(command));
         let sanitized_str = sanitized.as_ref();
         let should_scan = if matches!(sanitized, std::borrow::Cow::Owned(_)) {
             check_triggers(sanitized_str) == TriggerResult::Triggered
@@ -41809,13 +41912,25 @@ mod tests {
         }
 
         #[test]
-        fn unterminated_heredoc_allows_in_failopen_mode() {
+        fn unterminated_heredoc_requires_boundary_refusal_in_failopen_mode() {
             let settings = heredoc_config(true, true);
             let cmd = "python3 -c 'import shutil' << EOF\nsome content without closing";
             let result = eval_with_heredoc(cmd, &settings);
             assert!(
-                result.is_allowed(),
-                "unterminated heredoc should fail-open when fallback_on_parse_error=true"
+                result.is_denied(),
+                "receiver fallback cannot authorize unproven shell body boundaries"
+            );
+            assert!(
+                result.reason().is_some_and(|reason| {
+                    reason.starts_with("Heredoc ") && reason.contains("requires review")
+                }),
+                "expected structural refusal, got {result:?}"
+            );
+            let complete = format!("{cmd}\nEOF\n");
+            let complete_result = eval_with_heredoc(&complete, &settings);
+            assert!(
+                complete_result.is_allowed(),
+                "complete benign input retains receiver fallback: {complete_result:?}"
             );
         }
 
@@ -44955,6 +45070,280 @@ mod tests {
 
     mod inert_quoted_interpreter_heredoc {
         use super::{ShellDialect, evaluate_with_pack_ids_in_dialect};
+
+        const QUOTED_PROSE: &str = concat!(
+            "python3 - <<'PY'\n",
+            "section = '''Worker fallback\n",
+            "exception to this skill's worker defaults\n",
+            "`sbp route low --refresh --json` returns `no-route`.\n",
+            "'''\nprint(section)\nPY\n",
+        );
+
+        #[test]
+        fn mixed_here_strings_cannot_shift_heredoc_semantic_offsets() {
+            let command =
+                format!("cat <<<'12345678901'\n{QUOTED_PROSE}git reset --hard\ncat <<<'x'\n");
+            let compact = crate::heredoc::mask_non_executing_heredocs(&command);
+            // The historical -5/+5 replacements hide their intermediate drift
+            // from a total-length-only guard.
+            assert_eq!(compact.len(), command.len());
+            assert_ne!(
+                compact.find("git reset --hard"),
+                command.find("git reset --hard")
+            );
+            let semantic = crate::heredoc::mask_non_executing_heredocs_preserving_offsets(&command);
+            assert_eq!(semantic.len(), command.len());
+            let tail_start = command.find("git reset --hard").expect("tail");
+            assert_eq!(semantic.find("git reset --hard"), Some(tail_start));
+            let ranges = super::semantic_segments_around_heredoc_bodies(
+                semantic.as_ref(),
+                &command,
+                ShellDialect::Posix,
+            )
+            .expect("complete mixed boundaries");
+            assert!(ranges.iter().any(|&(start, end)| {
+                start == tail_start && semantic[start..end].trim() == "git reset --hard"
+            }));
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_denied(), "mixed executable tail: {result:?}");
+            let benign = command.replace("git reset --hard\n", "");
+            let result = evaluate_with_pack_ids_in_dialect(
+                &benign,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_allowed(), "mixed benign data: {result:?}");
+
+            let unicode = "cat <<<'é\n中\r\nx'\n";
+            let masked = crate::heredoc::mask_non_executing_heredocs_preserving_offsets(unicode);
+            assert_eq!(masked.len(), unicode.len());
+            assert_ne!(masked.as_ref(), unicode);
+            for (index, byte) in unicode.bytes().enumerate() {
+                if matches!(byte, b'\n' | b'\r') {
+                    assert_eq!(masked.as_bytes()[index], byte);
+                }
+            }
+        }
+
+        #[test]
+        fn semantic_segments_keep_outer_tail_at_exact_source_offsets() {
+            for prefix in ["", "# '\n", "# \"\n", "# `\n", "env "] {
+                let command = format!("{prefix}{QUOTED_PROSE}git reset --hard\n");
+                let primary =
+                    super::sanitize_around_heredoc_bodies(&command).expect("complete boundaries");
+                let secondary = super::mask_checked_posix_substitutions(
+                    primary.as_ref(),
+                    &command,
+                    ShellDialect::Posix,
+                );
+                let semantic = crate::heredoc::mask_non_executing_heredocs_preserving_offsets(
+                    secondary.as_ref(),
+                );
+                let ranges = super::semantic_segments_around_heredoc_bodies(
+                    semantic.as_ref(),
+                    &command,
+                    ShellDialect::Posix,
+                )
+                .expect("semantic boundaries");
+                let tail_start = command.rfind("git reset --hard").expect("tail");
+                assert!(
+                    ranges.iter().any(|&(start, end)| {
+                        start == tail_start && semantic[start..end].trim() == "git reset --hard"
+                    }),
+                    "tail is not an independent source segment: {prefix:?}: {ranges:?}"
+                );
+                // Existing full-view/body analysis remains present, not replaced.
+                for original in
+                    super::command_segment_ranges_in_dialect(semantic.as_ref(), ShellDialect::Posix)
+                {
+                    assert!(ranges.contains(&original));
+                }
+            }
+        }
+
+        #[test]
+        fn interpreter_quote_state_cannot_hide_trailing_posix_command() {
+            let benign = evaluate_with_pack_ids_in_dialect(
+                QUOTED_PROSE,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(benign.is_allowed(), "benign interpreter prose: {benign:?}");
+            for tail in ["git reset --hard\n", "git restore --worktree .\n"] {
+                let command = format!("{QUOTED_PROSE}{tail}");
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &command,
+                    &["core.git", "core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(result.is_denied(), "POSIX tail must deny: {result:?}");
+                let sanitized = super::sanitize_around_heredoc_bodies(&command)
+                    .expect("complete heredoc boundaries");
+                assert!(sanitized.ends_with(tail), "tail was masked: {sanitized:?}");
+                let substitutions_masked = super::mask_checked_posix_substitutions(
+                    sanitized.as_ref(),
+                    &command,
+                    ShellDialect::Posix,
+                );
+                assert!(
+                    substitutions_masked.ends_with(tail),
+                    "secondary substitution mask erased tail: {substitutions_masked:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn interpreter_quote_boundary_is_preserved_in_legacy_evaluation() {
+            let config = super::default_config();
+            let compiled = super::default_compiled_overrides();
+            let allowlists = super::default_allowlists();
+            let command = format!("{QUOTED_PROSE}git reset --hard\n");
+            let result = super::evaluate_command_with_legacy::<
+                crate::packs::SafePattern,
+                crate::packs::DestructivePattern,
+            >(
+                &command,
+                &config,
+                &["git"],
+                &compiled,
+                &allowlists,
+                &[],
+                &[],
+            );
+            assert!(result.is_denied(), "legacy tail must deny: {result:?}");
+        }
+
+        #[test]
+        fn comment_quotes_cannot_hide_heredoc_boundaries() {
+            let config = super::default_config();
+            let compiled = super::default_compiled_overrides();
+            let allowlists = super::default_allowlists();
+            for prefix in ["# '\n", "# \"\n", "# `\n"] {
+                let command = format!("{prefix}{QUOTED_PROSE}git reset --hard\n");
+                let posix = evaluate_with_pack_ids_in_dialect(
+                    &command,
+                    &["core.git", "core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(posix.is_denied(), "comment prefix {prefix:?}: {posix:?}");
+                let legacy = super::evaluate_command_with_legacy::<
+                    crate::packs::SafePattern,
+                    crate::packs::DestructivePattern,
+                >(
+                    &command,
+                    &config,
+                    &["git"],
+                    &compiled,
+                    &allowlists,
+                    &[],
+                    &[],
+                );
+                assert!(
+                    legacy.is_denied(),
+                    "legacy comment prefix {prefix:?}: {legacy:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn quote_boundary_repair_does_not_exempt_executable_content() {
+            for command in [
+                "python3 - <<PY\nprint('$(git reset --hard)')\nPY",
+                "sh <<'SH'\ngit reset --hard\nSH",
+                "python3 - <<'PY'\nimport os\nos.system('git reset --hard')\nPY",
+                "python3 - <<'PY'\ngit reset --hard\nPY",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    command,
+                    &["core.git", "core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(
+                    result.is_denied(),
+                    "executable control: {command:?}: {result:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn posix_tail_safety_does_not_depend_on_interpreter_exemption() {
+            for command in [
+                format!("env {QUOTED_PROSE}git reset --hard\n"),
+                format!("python3() {{ sh -s; }}\n{QUOTED_PROSE}git reset --hard\n"),
+                // A Python syntax error does not absorb the outer shell's next
+                // command: the heredoc is terminated and no `&&` gates the tail.
+                "python3 - <<'PY'\nprint('unterminated\nPY\ngit reset --hard\n".to_string(),
+                // Here the destructive command really precedes the unterminated
+                // heredoc. Text after its opener would still be stdin, NOT an
+                // executable shell tail, and is deliberately not our oracle.
+                "git reset --hard\npython3 - <<'PY'\nprint('unterminated\n".to_string(),
+                QUOTED_PROSE.replacen("<<'PY'\n", "<<'PY'; echo ready\n", 1) + "git reset --hard\n",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &command,
+                    &["core.git", "core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(
+                    result.is_denied(),
+                    "real outer command must remain protected: {command:?}: {result:?}",
+                );
+            }
+        }
+
+        #[test]
+        fn posix_tail_safety_survives_structural_extraction_limits() {
+            let many = "python3 - <<'FIRST'\npass\nFIRST\n".repeat(10)
+                + QUOTED_PROSE
+                + "git reset --hard\n";
+            let large = "# padding\n".repeat(27_000) + QUOTED_PROSE + "git reset --hard\n";
+            for command in [many, large] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &command,
+                    &["core.git", "core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(
+                    !result.is_allowed(),
+                    "limits must not silently allow an executable tail: {result:?}",
+                );
+                let config = super::default_config();
+                let legacy = super::evaluate_command_with_legacy::<
+                    crate::packs::SafePattern,
+                    crate::packs::DestructivePattern,
+                >(
+                    &command,
+                    &config,
+                    &["git"],
+                    &super::default_compiled_overrides(),
+                    &super::default_allowlists(),
+                    &[],
+                    &[],
+                );
+                assert!(!legacy.is_allowed(), "legacy limit: {legacy:?}");
+            }
+        }
+
+        #[test]
+        fn structural_boundaries_preserve_printed_data_and_non_heredoc_syntax() {
+            for command in [
+                "sh <<'SH'\necho 'git reset --hard'\nSH\necho done\n",
+                "python3 - <<'PY'\nprint(\"worker's notes # still data\")\nPY\necho done\n",
+                "echo '<<PY git reset --hard'",
+                "echo $((1 << 2))",
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    command,
+                    &["core.git", "core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(result.is_allowed(), "inert data: {command:?}: {result:?}");
+            }
+        }
 
         fn denied(command: &str) -> bool {
             [ShellDialect::Posix, ShellDialect::Unknown]

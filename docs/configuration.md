@@ -320,6 +320,15 @@ fallback_on_parse_error = true
 fallback_on_timeout = true
 ```
 
+Receiver-analysis fallback does not override shell boundary checks: an unproven
+heredoc body boundary or a structural hard limit (256 KiB command input or more
+than 10 heredocs) refuses even with `fallback_on_parse_error = true`. This
+intentionally also refuses benign unterminated heredocs; close the delimiter
+before retrying. Complete benign input retains the configured receiver-analysis
+fallback, including when its lower body-size, line or extraction-count limit is
+exceeded. Quoted `<<` text and arithmetic shifts are not heredocs when the
+bounded structural parser proves that distinction.
+
 CLI overrides:
 - `--heredoc-scan` / `--no-heredoc-scan`
 - `--heredoc-timeout <ms>`

@@ -7631,7 +7631,20 @@ pub(crate) fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize)
 /// heredoc content was replaced with placeholder text.
 #[must_use]
 pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
-    mask_non_executing_heredocs_with_policy(command, false, false)
+    mask_non_executing_heredocs_with_policy(command, false, false, HeredocMaskLayout::Compact)
+}
+
+enum HeredocMaskLayout {
+    Compact,
+    SourceOffsets,
+}
+
+/// Same receiver/inertness policy, with every replacement preserving source
+/// byte positions for semantic ranges derived from the original shell AST.
+pub(crate) fn mask_non_executing_heredocs_preserving_offsets(
+    command: &str,
+) -> std::borrow::Cow<'_, str> {
+    mask_non_executing_heredocs_with_policy(command, false, false, HeredocMaskLayout::SourceOffsets)
 }
 
 /// Mask the data of heredoc bodies whose target consumes stdin as data,
@@ -7652,19 +7665,20 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
 /// (`data_heredoc_bodies_whose_output_may_run`).
 #[must_use]
 pub fn mask_non_expanding_data_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
-    mask_non_executing_heredocs_with_policy(command, true, false)
+    mask_non_executing_heredocs_with_policy(command, true, false, HeredocMaskLayout::Compact)
 }
 
 /// Preserve the original Python syntax while proving report data, before shell
 /// token normalization can change its quoting or merge its argv literals.
 pub(crate) fn mask_python_json_reports(command: &str) -> std::borrow::Cow<'_, str> {
-    mask_non_executing_heredocs_with_policy(command, true, true)
+    mask_non_executing_heredocs_with_policy(command, true, true, HeredocMaskLayout::Compact)
 }
 
 fn mask_non_executing_heredocs_with_policy(
     command: &str,
     require_quoted_delimiter: bool,
     python_reports_only: bool,
+    layout: HeredocMaskLayout,
 ) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
 
@@ -7754,8 +7768,34 @@ fn mask_non_executing_heredocs_with_policy(
                     } else {
                         result.push_str(&command[pos..content_start]);
                     }
-                    // Replace content with placeholder
-                    result.push_str("'MASKED'");
+                    // A fixed placeholder is fine for the historical compact
+                    // view, but not for source-indexed semantic segmentation:
+                    // two opposing operand length changes can cancel overall
+                    // while shifting every byte between them.
+                    if matches!(layout, HeredocMaskLayout::SourceOffsets) {
+                        let content = &command[content_start..content_end];
+                        let mut placeholder: Vec<u8> = content
+                            .bytes()
+                            .map(|byte| {
+                                if matches!(byte, b'\n' | b'\r') {
+                                    byte
+                                } else {
+                                    b'_'
+                                }
+                            })
+                            .collect();
+                        if placeholder.len() >= 2 {
+                            placeholder[0] = b'\'';
+                            let last = placeholder.len() - 1;
+                            placeholder[last] = b'\'';
+                        }
+                        result.push_str(
+                            &String::from_utf8(placeholder)
+                                .expect("source-offset placeholder is ASCII"),
+                        );
+                    } else {
+                        result.push_str("'MASKED'");
+                    }
                     pos = content_end;
                     continue;
                 }
@@ -8397,6 +8437,45 @@ enum HeredocOutput {
     /// Into something that may run it as code: a shell, an interpreter, a
     /// remote or privileged shell, `xargs`, a process substitution, `eval`.
     Executes,
+}
+
+/// Complete outer-shell heredoc body boundaries, not an inertness exemption.
+/// Bodies remain available to their receiver's execution analysis. Unlike the
+/// quoted-interpreter helper, this never returns a truncated prefix of bodies.
+pub(crate) fn structural_heredoc_body_ranges(
+    command: &str,
+) -> Result<Vec<Range<usize>>, &'static str> {
+    // The trigger scanner is deliberately heuristic and does not model shell
+    // comments. Its false negative must not certify absence: an apostrophe in
+    // a comment can hide a later real operator from its quote state.
+    if !command.contains("<<") {
+        return Ok(Vec::new());
+    }
+    let heredocs = active_heredocs(command)
+        .ok_or("Heredoc boundary analysis incomplete or unsupported; command requires review")?;
+    if heredocs.len() > ExtractionLimits::default().max_heredocs {
+        return Err("Heredoc boundary count exceeds analysis limit; command requires review");
+    }
+    let mut ranges: Vec<_> = heredocs
+        .into_iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                ..
+            } => Some(body_start..body_end),
+            ActiveHeredocBody::HereString => None,
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut end = 0;
+    for range in &ranges {
+        if range.start < end || range.end >= command.len() || command.get(range.clone()).is_none() {
+            return Err("Heredoc body boundaries overlap or are invalid; command requires review");
+        }
+        end = range.end;
+    }
+    Ok(ranges)
 }
 
 fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
@@ -15339,6 +15418,27 @@ EOF";
 
     mod inert_interpreter_stdin {
         use super::*;
+
+        #[test]
+        fn structural_ranges_are_complete_and_do_not_claim_inertness() {
+            for header in ["python3 -", "env python3 -", "sh", "cat"] {
+                let command = format!("{header} <<'END'\nbody's quotes\nEND\necho tail");
+                let ranges = structural_heredoc_body_ranges(&command).expect("complete boundary");
+                assert_eq!(ranges.len(), 1);
+                assert!(command[ranges[0].clone()].contains("body's quotes"));
+                assert!(!command[ranges[0].clone()].contains("echo tail"));
+            }
+            let commented = "# '\npython3 <<'END'\nbody's quotes\nEND\necho tail";
+            assert_eq!(structural_heredoc_body_ranges(commented).unwrap().len(), 1);
+            for command in ["echo '<<END'", "echo $((1 << 2))"] {
+                assert!(structural_heredoc_body_ranges(command).unwrap().is_empty());
+            }
+            assert!(structural_heredoc_body_ranges("python3 <<'END'\nmissing end").is_err());
+            let many = "cat <<'END'\ntext\nEND\n".repeat(11);
+            assert!(structural_heredoc_body_ranges(&many).is_err());
+            let large = "# padding\n".repeat(27_000) + "cat <<'END'\ntext\nEND\n";
+            assert!(structural_heredoc_body_ranges(&large).is_err());
+        }
 
         #[test]
         fn quoted_non_shell_ranges_require_the_same_receiver_provenance() {
