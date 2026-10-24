@@ -5,6 +5,8 @@
 
 use vergen_gix::{Build, Cargo, Emitter, Gix, Rustc};
 
+mod build_git_inputs;
+
 const DSR_RELEASE_GIT_SHA: &str = "DSR_RELEASE_GIT_SHA";
 const DSR_RELEASE_GIT_REF: &str = "DSR_RELEASE_GIT_REF";
 const EMBEDDED_GIT_SHA: &str = "DCG_DSR_GIT_SHA";
@@ -41,6 +43,15 @@ fn main() {
     // Strict DSR builds use the stronger exact source identity below.
     println!("cargo:rerun-if-env-changed=DCG_RELEASE_BUILD");
     emit_dsr_release_provenance();
+    let package_has_git = match build_git_inputs::emit_git_rerun_inputs(std::path::Path::new(env!(
+        "CARGO_MANIFEST_DIR"
+    ))) {
+        Ok(present) => present,
+        Err(error) => {
+            eprintln!("could not register Git provenance inputs: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let mut emitter = Emitter::default();
 
@@ -57,8 +68,10 @@ fn main() {
         eprintln!("cargo:warning=vergen rustc instructions failed: {e}");
     }
 
-    if let Err(e) = emitter.add_instructions(&gix) {
-        eprintln!("cargo:warning=vergen git instructions failed: {e}");
+    if package_has_git {
+        if let Err(e) = emitter.add_instructions(&gix) {
+            eprintln!("cargo:warning=vergen git instructions failed: {e}");
+        }
     }
 
     // Emit all collected instructions
